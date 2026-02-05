@@ -18,6 +18,15 @@ from telegram.ext import (
     ConversationHandler
 )
 
+# ========== VERIFICAR VERSIÓN ==========
+import telegram
+print(f"🔍 VERSIÓN INSTALADA: {telegram.__version__}")
+if telegram.__version__ != "20.7":
+    print(f"❌ ERROR: Versión incorrecta. Se esperaba 20.7, se encontró {telegram.__version__}")
+    print("💡 Render está usando caché vieja. Forzando reinstalación...")
+else:
+    print("✅ Versión correcta: 20.7")
+
 TOKEN = os.environ.get('BOT_TOKEN')
 if not TOKEN:
     print("❌ ERROR: BOT_TOKEN no configurado")
