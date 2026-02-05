@@ -4,14 +4,12 @@ services:
     env: python
     plan: free
     region: oregon
-    buildCommand: |
-      pip install --upgrade pip
-      pip install --no-cache-dir python-telegram-bot==20.7
+    buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        sync: 8498585179:AAGt4s7cKB28UgA7UFQNm6XXKowG7AWItE0
       - key: ADMIN_ID
-        sync: false
+        sync: 1196575284
     healthCheckPath: /health
     autoDeploy: true
