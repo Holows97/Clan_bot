@@ -8,8 +8,8 @@ services:
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: 8498585179:AAGt4s7cKB28UgA7UFQNm6XXKowG7AWItE0
+        sync: false
       - key: ADMIN_ID
-        sync: 1196575284
+        sync: false
     healthCheckPath: /health
     autoDeploy: true
