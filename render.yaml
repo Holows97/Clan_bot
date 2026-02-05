@@ -5,9 +5,23 @@ services:
     plan: free
     region: oregon
     buildCommand: |
-      pip install --upgrade pip
+      echo "=== LIMPIANDO ARCHIVOS CORRUPTOS ==="
+      find /opt/render/project/src -name "*.pyc" -delete
+      find /opt/render/project/src -name "__pycache__" -type d -exec rm -rf {} +
+      echo "=== REINSTALANDO COMPLETAMENTE ==="
+      pip uninstall -y python-telegram-bot
       pip cache purge
-      pip install --force-reinstall python-telegram-bot==20.7
+      rm -rf /opt/render/.cache/pip
+      echo "=== INSTALANDO NUEVO ==="
+      pip install --no-cache-dir --force-reinstall python-telegram-bot==20.7
+      echo "=== VERIFICANDO INSTALACIÓN ==="
+      python -c "
+      import telegram
+      import telegram.ext
+      print(f'Versión telegram: {telegram.__version__}')
+      print(f'Módulo updater: {hasattr(telegram.ext, \"Updater\")}')
+      print(f'Path: {telegram.ext.__file__}')
+      "
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN

@@ -6,8 +6,7 @@ Compatible con python-telegram-bot v20.7
 import os
 import json
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
+from telegram.ext import Application (
     Application,
     CommandHandler,
     CallbackQueryHandler,
@@ -24,6 +23,29 @@ if telegram.__version__ != "20.7":
     exit(1)
 else:
     print("✅ Versión correcta: 20.7")
+
+# ========== DIAGNÓSTICO PROFUNDO ==========
+print("🔍 DIAGNÓSTICO INTERNO:")
+print("-" * 40)
+
+try:
+    import telegram.ext._updater as updater_module
+    print(f"✅ Módulo _updater cargado: {updater_module.__file__}")
+    
+    # Verificar atributos del módulo
+    import inspect
+    print("🔧 Atributos de Updater class:")
+    from telegram.ext import Updater
+    members = inspect.getmembers(Updater)
+    attrs = [name for name, _ in members if not name.startswith('_')]
+    print(f"   Atributos públicos: {', '.join(attrs[:5])}...")
+    
+except Exception as e:
+    print(f"❌ Error cargando módulo: {e}")
+    import traceback
+    traceback.print_exc()
+
+print("-" * 40)
 
 # ========== CONFIGURACIÓN ==========
 TOKEN = os.environ.get('BOT_TOKEN')
