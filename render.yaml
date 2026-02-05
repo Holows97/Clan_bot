@@ -12,5 +12,4 @@ services:
       - key: ADMIN_ID
         sync: false
       - key: WEBHOOK_URL
-        value: "https://clan-bot.onrender.com"  # URL pública que Render asigna
-
+        value: "https://clan-bot-r388.onrender.com"
