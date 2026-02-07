@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: clan-bot
+    name: bot-clan
     env: python
     plan: free
     region: oregon
@@ -12,4 +12,8 @@ services:
       - key: ADMIN_ID
         sync: false
       - key: WEBHOOK_URL
-        value: "https://clan-bot-r388.onrender.com"
+        value: "https://clan-bot-r388.onrender.com/<BOT_TOKEN>"
+      - key: PORT
+        value: "8443"
+      - key: DATA_DIR
+        value: "/tmp/clan_bot"
