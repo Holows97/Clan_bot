@@ -790,19 +790,49 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
 
-def main():
-    if not WEBHOOK_URL:
-        raise RuntimeError("WEBHOOK_URL no está definida. En Render configura WEBHOOK_URL a la URL pública de tu servicio (ej: https://mi-app.onrender.com/<token>).")
-    app = build_application()
-    webhook_path = f"/{TOKEN}"
-    listen_addr = "0.0.0.0"
-    logger.info("Estableciendo webhook en %s (path %s) en el puerto %s", WEBHOOK_URL, webhook_path, PORT)
-    app.run_webhook(
-        listen=listen_addr,
-        port=PORT,
-        webhook_url=WEBHOOK_URL,
-        webhook_path=webhook_path,
-    )
+# ------------------ Webhook manual para Render ------------------
+import asyncio
+from flask import Flask, request
+
+# Reutilizamos TOKEN, WEBHOOK_URL y PORT ya definidos arriba
+flask_app = Flask(__name__)
+
+def start_application():
+    """Construye la Application y registra el webhook en Telegram."""
+    # build_application debe existir en tu código y devolver Application con handlers añadidos
+    application = Application.builder().token(TOKEN).build()  # si usas Application(...) ajusta según tu build
+    # Si tienes una función build_application() definida, úsala en su lugar:
+    # application = build_application.get_event_loop()
+    logger.info("Registrando webhook en %s", WEBHOOK_URL)
+    loop.run_until_complete(application.bot.set_webhook(WEBHOOK_URL))
+
+    return application, loop
+
+# Construir la aplicación y obtener el loop
+application, loop = start_application()
+
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+def webhook_receiver():
+    """Recibe updates de Telegram y los pasa a la Application."""
+    data = request.get_json(force=True)
+    if not data:
+        return "no data", 400
+
+    update = Update.de_json(data, application.bot)
+    try:
+        # Programar el procesamiento asíncrono del update
+        loop.create_task(application.process_update(update))
+    except RuntimeError:
+        # Fallback si el loop no está corriendo
+        asyncio.run(application.process_update(update))
+    return "ok", 200
+
+if __name__ == "__main__":
+    # Para desarrollo local (en Render usarás gunicorn)
+    listen = "0.0.0.0"
+    port = int(os.environ.get("PORT", PORT))
+    logger.info("Iniciando Flask en %s:%s", listen, port)
+    flask_app.run(host=listen, port=port)
 
 if __name__ == "__main__":
     main()
