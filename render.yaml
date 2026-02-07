@@ -5,23 +5,6 @@ services:
     plan: free
     region: oregon
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: ADMIN_ID
-        sync: false
-      - key: WEBHOOK_URL
-        value: "https://clan-bot-r388.onrender.com/<BOT_TOKEN>"
-      - key: PORT
-        value: "8443"
-      - key: DATA_DIR
-services:
-  - type: web
-    name: bot-clan
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
     startCommand: "python bot_clan.py"
     envVars:
       - key: TOKEN
