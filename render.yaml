@@ -16,4 +16,19 @@ services:
       - key: PORT
         value: "8443"
       - key: DATA_DIR
+services:
+  - type: web
+    name: bot-clan
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot_clan.py"
+    envVars:
+      - key: TOKEN
+        sync: false
+      - key: ADMIN_USER_ID
+        sync: false
+      - key: WEBHOOK_URL
+        value: "https://<tu-servicio>.onrender.com/<TOKEN>"
+      - key: DATA_DIR
         value: "/tmp/clan_bot"
