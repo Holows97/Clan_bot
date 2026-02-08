@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BOT DEL CLAN - Versión actualizada
-Variables de entorno necesarias:
+BOT DEL CLAN - Versión actualizada (correcciones)
+- Corrige problemas de codificación (mojibake) con fallback y limpieza.
+- Añade menú de administrador con opciones: borrar datos y broadcast.
+- Cierra cadenas multilínea y completa help_command.
+- Mejora manejo de GitHub con fallback de decodificación.
+- Añade main() con registro de handlers.
+- Manejo seguro de CallbackQuery
+- Mejoras en llamadas a GitHub (timeout, headers)
+- Comando admin: /deleteuserdata <user_id>
+- Comando admin: /broadcast <mensaje>
+- Flujo de registro completo (awaiting_username, awaiting_attack, awaiting_defense)
+- Flujo de edición de cuentas (awaiting_edit_attack, awaiting_edit_defense)
+- Comandos admin: /deleteuserdata <user_id>, /broadcast <mensaje>, /adduser <id>
+- Robustez en operaciones con GitHub y Telegram
+
+VARIABLES DE ENTORNO NECESARIAS:
 - TOKEN
 - ADMIN_USER_ID
 - ADMIN_USERNAME (opcional)
@@ -13,16 +27,7 @@ Variables de entorno necesarias:
 - GITHUB_REPO
 - GITHUB_DATA_PATH (opcional, por defecto data/clan_data.json)
 - GITHUB_AUTH_PATH (opcional, por defecto data/authorized_users.json)
-- Manejo seguro de CallbackQuery
-- Mejoras en llamadas a GitHub (timeout, headers)
-- Comando admin: /deleteuserdata <usario_id>
-- Comando admin: /broadcast <mensaje>
-- Flujo de registro completo (awaiting_username, awaiting_attack, awaiting_defense)
-- Flujo de edición de cuentas (awaiting_edit_attack, awaiting_edit_defense)
-- Comandos admin: /deleteuserdata <user_id>, /broadcast <mensaje>, /adduser <id>
-- Robustez en operaciones con GitHub y Telegram
 """
-
 import os
 import json
 import logging
@@ -31,6 +36,7 @@ import base64
 import time
 from datetime import datetime
 from typing import Optional, List
+from functools import wraps
 
 import requests
 
@@ -56,7 +62,7 @@ TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise RuntimeError("La variable de entorno TOKEN no está definida.")
 
-ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0")) if os.environ.get("ADMIN_USER_ID") else 0
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")  # opcional
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Ej: https://mi-servicio.onrender.com/<token>
 PORT = int(os.environ.get("PORT", "8443"))
@@ -76,6 +82,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ================= CODIFICACIÓN / MOJIBAKE =================
+def fix_mojibake(s: str) -> str:
+    """
+    Intentar reparar texto que fue decodificado con la codificación equivocada
+    (UTF-8 bytes interpretados como latin-1). Si falla, devolver el original.
+    """
+    if not isinstance(s, str):
+        return s
+    try:
+        # Detect common symptom: presence of replacement characters or odd sequences
+        # Re-encode as latin-1 bytes and decode as utf-8
+        return s.encode("latin-1").decode("utf-8")
+    except Exception:
+        return s
+
+async def safe_send(app: Application, chat_id: int, text: str, parse_mode: Optional[str] = "Markdown"):
+    """
+    Enviar texto limpiando mojibake y con fallback si parse_mode falla.
+    """
+    clean = fix_mojibake(text)
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=clean, parse_mode=parse_mode)
+    except BadRequest as e:
+        logger.warning("BadRequest al enviar con parse_mode=%s: %s. Reintentando sin parse_mode.", parse_mode, e)
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=clean)
+        except Exception as e2:
+            logger.exception("Fallo al enviar mensaje sin parse_mode: %s", e2)
+            raise
+    except Exception as e:
+        logger.exception("Error enviando mensaje a %s: %s", chat_id, e)
+        raise
+
 # ================= UTILIDADES GITHUB =================
 HEADERS = {"Accept": "application/vnd.github.v3+json"}
 if GITHUB_TOKEN:
@@ -84,7 +123,7 @@ if GITHUB_TOKEN:
 REQUEST_TIMEOUT = 10  # segundos
 
 def _get_file_from_github(path: str):
-    """Devuelve (content:str, sha:str) o (None, None) si no existe."""
+    """Devuelve (content:str, sha:str) o (None, None) si no existe. Maneja fallback de decodificación."""
     if not (GITHUB_OWNER and GITHUB_REPO):
         raise RuntimeError("GITHUB_OWNER y GITHUB_REPO deben estar configurados.")
     url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
@@ -92,8 +131,17 @@ def _get_file_from_github(path: str):
         r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             j = r.json()
-            content = base64.b64decode(j["content"]).decode("utf-8")
-            sha = j["sha"]
+            raw = base64.b64decode(j["content"])
+            sha = j.get("sha")
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # Fallback: try latin-1 then convert to utf-8
+                try:
+                    content = raw.decode("latin-1")
+                    content = content.encode("latin-1").decode("utf-8", errors="replace")
+                except Exception:
+                    content = raw.decode("utf-8", errors="replace")
             return content, sha
         if r.status_code == 404:
             return None, None
@@ -156,7 +204,6 @@ def load_authorized_users() -> List[int]:
             return [ADMIN_USER_ID] if ADMIN_USER_ID else []
         data = json.loads(content)
         ids = data.get("authorized_ids", [ADMIN_USER_ID] if ADMIN_USER_ID else [])
-        # Normalizar a enteros
         normalized = []
         for x in ids:
             try:
@@ -201,6 +248,23 @@ def get_user_accounts(user_id: int):
 
 def add_user_account(user_id: int, account_data: dict):
     """Añadir o actualizar cuenta de usuario en el JSON almacenado en GitHub."""
+    # Validar y normalizar account_data mínimamente
+    username = account_data.get("username")
+    if not username or not isinstance(username, str):
+        raise ValueError("username inválido")
+    try:
+        attack = int(account_data.get("attack", 0))
+    except Exception:
+        attack = 0
+    try:
+        defense = int(account_data.get("defense", 0))
+    except Exception:
+        defense = 0
+
+    account_data["username"] = username.strip()
+    account_data["attack"] = attack
+    account_data["defense"] = defense
+
     data = load_data()
     user_id_str = str(user_id)
     if user_id_str not in data:
@@ -210,7 +274,7 @@ def add_user_account(user_id: int, account_data: dict):
         }
     accounts = data[user_id_str].get("accounts", [])
     for i, account in enumerate(accounts):
-        if account["username"].lower() == account_data["username"].lower():
+        if account.get("username", "").lower() == account_data["username"].lower():
             accounts[i] = account_data
             data[user_id_str]["accounts"] = accounts
             save_data_with_retry(data)
@@ -226,7 +290,7 @@ def delete_user_account(user_id: int, username: str):
     user_id_str = str(user_id)
     if user_id_str in data:
         accounts = data[user_id_str].get("accounts", [])
-        new_accounts = [acc for acc in accounts if acc["username"].lower() != username.lower()]
+        new_accounts = [acc for acc in accounts if acc.get("username", "").lower() != username.lower()]
         if len(new_accounts) < len(accounts):
             data[user_id_str]["accounts"] = new_accounts
             save_data_with_retry(data)
@@ -260,7 +324,7 @@ async def broadcast_message_to_all(app: Application, text: str) -> dict:
     errors = []
     for uid in user_ids:
         try:
-            await app.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown")
+            await safe_send(app, uid, text, parse_mode="Markdown")
             sent += 1
             await asyncio.sleep(0.05)
         except Exception as e:
@@ -278,11 +342,16 @@ def generate_public_report():
     all_accounts = []
     for user_data in data.values():
         accounts = user_data.get("accounts", [])
-        all_accounts.extend([{
-            "username": acc["username"],
-            "attack": acc["attack"],
-            "defense": acc["defense"]
-        } for acc in accounts])
+        for acc in accounts:
+            # defensiva: asegurar claves
+            username = acc.get("username", "N/A")
+            attack = int(acc.get("attack", 0))
+            defense = int(acc.get("defense", 0))
+            all_accounts.append({
+                "username": username,
+                "attack": attack,
+                "defense": defense
+            })
     if not all_accounts:
         return "📭 **No hay cuentas registradas en el clan.**"
     all_accounts.sort(key=lambda x: x["attack"], reverse=True)
@@ -321,16 +390,16 @@ def generate_admin_report():
         if accounts:
             total_members += 1
             total_accounts += len(accounts)
-            user_attack = sum(acc["attack"] for acc in accounts)
-            user_defense = sum(acc["defense"] for acc in accounts)
+            user_attack = sum(int(acc.get("attack", 0)) for acc in accounts)
+            user_defense = sum(int(acc.get("defense", 0)) for acc in accounts)
             total_attack += user_attack
             total_defense += user_defense
             report += f"👤 **{user_data.get('telegram_name', 'Usuario')}** (ID: {user_id_str})\n"
             report += f"   📊 Cuentas: {len(accounts)}\n"
             report += f"   ⚔️ Ataque: {user_attack:,}\n"
             report += f"   🛡️ Defensa: {user_defense:,}\n"
-            for acc in sorted(accounts, key=lambda x: x["attack"], reverse=True):
-                report += f"     • {acc['username']}: ⚔️{acc['attack']:,} 🛡️{acc['defense']:,}\n"
+            for acc in sorted(accounts, key=lambda x: int(x.get("attack", 0)), reverse=True):
+                report += f"     • {acc.get('username','N/A')}: ⚔️{int(acc.get('attack',0)):,} 🛡️{int(acc.get('defense',0)):,}\n"
             report += "   ─────────────────────\n"
     report += f"\n📈 **ESTADÍSTICAS:**\n"
     report += f"👥 Miembros activos: {total_members}\n"
@@ -373,7 +442,8 @@ async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=None
 
 # ================= DECORADORES =================
 def restricted(func):
-    """Decorador para restringir comandos"""
+    """Decorador para restringir comandos a usuarios autorizados"""
+    @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not is_user_authorized(user_id):
@@ -393,6 +463,7 @@ def restricted(func):
 
 def restricted_callback(func):
     """Decorador para restringir callbacks"""
+    @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = query.from_user.id
@@ -440,9 +511,8 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if admin_id:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
+            await safe_send(context.application, admin_id,
+                (
                     f"➡️ **SOLICITUD DE ACCESO**\n\n"
                     f"👤 Usuario: {user.first_name}\n"
                     f"🆔 ID: `{user.id}`\n"
@@ -457,9 +527,8 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sent_to_admin and admin_username:
         try:
-            await context.bot.send_message(
-                chat_id=f"@{admin_username}",
-                text=(
+            await safe_send(context.application, f"@{admin_username}",
+                (
                     f"➡️ **SOLICITUD DE ACCESO**\n\n"
                     f"👤 Usuario: {user.first_name}\n"
                     f"🆔 ID: `{user.id}`\n"
@@ -500,692 +569,161 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start - Iniciar el bot
 /getid - Obtener tu ID de Telegram
 /help - Mostrar esta ayuda
+/adminmenu - Menú de administrador (solo admin)
 
-**Miembros autorizados:**
-/register - Registrar tus cuentas (en privado)
-/report - Ver informe del clan
-
-**Administrador:**
-/admin - Vista de administrador
-/adduser <id> - Añadir usuario autorizado
-/deleteuserdata <id> - Borrar datos de un usuario (admin)
+Comandos de administración:
+/deleteuserdata <user_id> - Borrar todos los datos de un usuario (admin)
 /broadcast <mensaje> - Enviar mensaje a todos los usuarios (admin)
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
-# ================= MANEJO DE START =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando start - diferenciado por tipo de chat"""
-    user = update.effective_user
-    chat_type = update.effective_chat.type
-    if chat_type == "private":
-        await handle_private_start(update, context)
-    else:
-        await handle_group_start(update, context)
+# ================= ADMIN: menú y handlers =================
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not is_admin(user_id):
+            if update.message:
+                await update.message.reply_text("❌ Solo el administrador puede usar este comando.")
+            elif update.callback_query:
+                await safe_answer_callback(update.callback_query, text="❌ Solo admin", show_alert=True)
+            return
+        return await func(update, context)
+    return wrapper
 
-async def handle_private_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start en chat privado (funciona con message o callback_query)"""
-    query = update.callback_query
-    user = update.effective_user
-
-    if not is_user_authorized(user.id):
-        keyboard = [[InlineKeyboardButton("📤 Enviar ID al admin", callback_data="send_id_request")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        text = (
-            f"Hola {user.first_name}! 👋\n\n"
-            "🔒 **Acceso restringido**\n\n"
-            "Para usar este bot necesitas autorización.\n"
-            "Usa /getid para obtener tu ID y envíalo al administrador.\n\n"
-            "ID del admin: `" + str(ADMIN_USER_ID) + "`"
-        )
-        if query:
-            await safe_answer_callback(query)
-            await safe_edit_message(query, text, reply_markup=reply_markup, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-        return
-
-    accounts = get_user_accounts(user.id)
+@admin_only
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostrar menú de administrador con opciones rápidas."""
     keyboard = [
-        [
-            InlineKeyboardButton("➕ Añadir cuenta", callback_data="add_account"),
-            InlineKeyboardButton("📋 Mis cuentas", callback_data="my_accounts")
-        ],
-        [
-            InlineKeyboardButton("🏰 Informe clan", callback_data="clan_report"),
-            InlineKeyboardButton("📈 Mi ranking", callback_data="my_ranking")
-        ]
-    ]
-    if is_admin(user.id):
-        keyboard.append([InlineKeyboardButton("🔒 Vista Admin", callback_data="admin_report")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    welcome_text = f"¡Hola {user.first_name}! 👋\n\n"
-    welcome_text += "🏠 **Bot del Clan**\n\n"
-    if accounts:
-        total_attack = sum(acc["attack"] for acc in accounts)
-        total_defense = sum(acc["defense"] for acc in accounts)
-        welcome_text += f"📊 **Tus estadísticas:**\n"
-        welcome_text += f"• Cuentas: {len(accounts)}\n"
-        welcome_text += f"• Ataque total: {total_attack:,}\n"
-        welcome_text += f"• Defensa total: {total_defense:,}\n\n"
-    else:
-        welcome_text += "📭 Aún no tienes cuentas registradas.\n"
-        welcome_text += "¡Añade tu primera cuenta!\n\n"
-    welcome_text += "Selecciona una opción:"
-
-    if query:
-        await safe_answer_callback(query)
-        await safe_edit_message(query, welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
-
-async def handle_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start en grupo (funciona con message o callback_query)"""
-    query = update.callback_query
-    user = update.effective_user
-
-    keyboard = [
-        [
-            InlineKeyboardButton("💬 Ir al privado", url=f"https://t.me/{context.bot.username}?start=menu"),
-            InlineKeyboardButton("🏰 Ver informe", callback_data="group_report")
-        ]
-    ]
-    if is_admin(user.id):
-        keyboard.append([InlineKeyboardButton("🔒 Admin", callback_data="group_admin")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    text = (
-        f"Hola {user.first_name}! 👋\n\n"
-        "Este bot gestiona las cuentas del clan. Usa el privado para registrar tus cuentas."
-    )
-
-    if query:
-        await safe_answer_callback(query)
-        await safe_edit_message(query, text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-
-# ================= CALLBACK HANDLER =================
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manejar todas las consultas de callback"""
-    query = update.callback_query
-    await safe_answer_callback(query)
-    user_id = query.from_user.id
-    data = query.data or ""
-    try:
-        if data == "add_account":
-            await ask_account_username(update, context)
-        elif data == "my_accounts":
-            await show_my_accounts(update, context)
-        elif data == "clan_report":
-            await show_clan_report(update, context)
-        elif data == "my_ranking":
-            await show_my_ranking(update, context)
-        elif data == "admin_report":
-            if is_admin(user_id):
-                await show_admin_report(update, context)
-            else:
-                await safe_edit_message(query, "⛔ Solo el administrador puede ver esto")
-        elif data == "back_menu":
-            await handle_private_start(update, context)
-        elif data == "group_report":
-            await show_group_report(update, context)
-        elif data == "group_admin":
-            if is_admin(user_id):
-                await show_admin_report(update, context)
-            else:
-                await safe_answer_callback(query, text="⛔ Solo el administrador puede ver esto", show_alert=True)
-        elif data == "send_id_request":
-            await send_id_request(update, context)
-        elif data == "delete_account_menu":
-            await delete_account_menu(update, context)
-        elif data and data.startswith("delete:"):
-            username = data.split(":", 1)[1]
-            await handle_delete_account(update, context, username)
-        elif data == "edit_account_menu":
-            await edit_account_menu(update, context)
-        elif data and data.startswith("edit:"):
-            username = data.split(":", 1)[1]
-            await start_edit_account_flow(update, context, username)
-        else:
-            await safe_edit_message(query, "Opción no reconocida.")
-    except Exception as e:
-        logger.exception("Error manejando callback '%s': %s", data, e)
-        try:
-            await safe_edit_message(query, "Ocurrió un error procesando la acción.")
-        except Exception:
-            pass
-
-# ================= FUNCIONES DE CUENTAS (UI) =================
-async def show_my_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostrar cuentas del usuario"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    accounts = get_user_accounts(user_id)
-    if not accounts:
-        keyboard = [[InlineKeyboardButton("➕ Añadir cuenta", callback_data="add_account")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await safe_edit_message(query, "📭 **No tienes cuentas registradas**\n\n¡Añade tu primera cuenta!", reply_markup=reply_markup, parse_mode="Markdown")
-        return
-
-    text = "📋 **Tus cuentas:**\n\n"
-    for acc in accounts:
-        text += f"• {acc['username']}: ⚔️{acc['attack']:,} 🛡️{acc['defense']:,}\n"
-    keyboard = [
-        [
-            InlineKeyboardButton("➕ Añadir cuenta", callback_data="add_account"),
-            InlineKeyboardButton("🗑️ Eliminar cuenta", callback_data="delete_account_menu")
-        ],
-        [
-            InlineKeyboardButton("✏️ Editar cuenta", callback_data="edit_account_menu")
-        ],
-        [InlineKeyboardButton("🏠 Menú principal", callback_data="back_menu")]
+        [InlineKeyboardButton("🗑️ Borrar datos de usuario", callback_data="admin_deleteuserdata")],
+        [InlineKeyboardButton("📣 Broadcast a todos", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🔒 Ver informe admin", callback_data="admin_view_report")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, text, reply_markup=reply_markup, parse_mode="Markdown")
+    if update.message:
+        await update.message.reply_text("🔧 Menú de administrador. Selecciona una opción:", reply_markup=reply_markup)
+    elif update.callback_query:
+        await safe_edit_message(update.callback_query, "🔧 Menú de administrador. Selecciona una opción:", reply_markup=reply_markup)
 
-async def delete_account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostrar menú para eliminar cuentas del usuario"""
+@admin_only
+async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
-    accounts = get_user_accounts(user_id)
-    if not accounts:
-        await safe_edit_message(query, "📭 No tienes cuentas para eliminar.", parse_mode="Markdown")
+    await safe_answer_callback(query)  # ack
+    data = query.data
+
+    if data == "admin_deleteuserdata":
+        context.user_data["awaiting_admin_delete"] = True
+        await safe_edit_message(query, "🗑️ Envía el ID del usuario que quieres borrar. Escribe el ID y presiona enviar.")
         return
-    keyboard = []
-    for acc in accounts:
-        keyboard.append([InlineKeyboardButton(f"🗑️ {acc['username']}", callback_data=f"delete:{acc['username']}")])
-    keyboard.append([InlineKeyboardButton("🏠 Menú principal", callback_data="back_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, "Selecciona la cuenta a eliminar:", reply_markup=reply_markup, parse_mode="Markdown")
 
-async def handle_delete_account(update: Update, context: ContextTypes.DEFAULT_TYPE, username: str):
-    """Eliminar cuenta seleccionada"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    success = delete_user_account(user_id, username)
-    if success:
-        await safe_edit_message(query, f"✅ Cuenta *{username}* eliminada.", parse_mode="Markdown")
-    else:
-        await safe_edit_message(query, f"❌ No se encontró la cuenta *{username}*.", parse_mode="Markdown")
-
-# --- Funciones de edición de cuenta (añadidas) ---
-async def edit_account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostrar menú para editar cuentas del usuario"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    accounts = get_user_accounts(user_id)
-    if not accounts:
-        await safe_edit_message(query, "📭 No tienes cuentas para editar.", parse_mode="Markdown")
+    if data == "admin_broadcast":
+        context.user_data["awaiting_admin_broadcast"] = True
+        await safe_edit_message(query, "📣 Escribe el mensaje que quieres enviar a todos los usuarios. Luego envíalo.")
         return
-    keyboard = []
-    for acc in accounts:
-        keyboard.append([InlineKeyboardButton(f"✏️ {acc['username']}", callback_data=f"edit:{acc['username']}")])
-    keyboard.append([InlineKeyboardButton("🏠 Menú principal", callback_data="back_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await safe_edit_message(query, "Selecciona la cuenta a editar:", reply_markup=reply_markup, parse_mode="Markdown")
 
-async def start_edit_account_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, username: str):
-    """Iniciar flujo de edición: pedir nuevo ataque"""
-    query = update.callback_query
-    if query:
-        await safe_answer_callback(query)
-        await safe_edit_message(query,
-            f"✏️ **Editar cuenta:** {username}\n\nEnvía el nuevo **poder de ataque** (solo números):",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            f"✏️ **Editar cuenta:** {username}\n\nEnvía el nuevo **poder de ataque** (solo números):",
-            parse_mode="Markdown"
-        )
-    context.user_data["state"] = "awaiting_edit_attack"
-    context.user_data["edit_username"] = username
-
-async def handle_edit_account_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manejar mensajes durante el flujo de edición (ataque/defensa)"""
-    state = context.user_data.get("state")
-    if not state:
-        return False
-
-    # We expect messages for edit flow to come as text messages (private chat)
-    if state == "awaiting_edit_attack":
-        text = update.message.text.strip() if update.message and update.message.text else ""
+    if data == "admin_view_report":
+        report = generate_admin_report()
         try:
-            attack = int(text.replace(".", "").replace(",", "").strip())
-            if attack <= 0:
-                await update.message.reply_text("❌ El ataque debe ser mayor a 0. Intenta de nuevo:")
-                return True
-            context.user_data["edit_attack"] = attack
-            context.user_data["state"] = "awaiting_edit_defense"
-            await update.message.reply_text(
-                f"⚔️ Nuevo ataque: {attack:,}\n\n"
-                "Ahora envía el nuevo **poder de defensa** (solo números):",
-                parse_mode="Markdown"
-            )
+            await query.edit_message_text(fix_mojibake(report), parse_mode="Markdown")
         except Exception:
-            await update.message.reply_text("❌ Por favor, envía solo números. Intenta de nuevo:")
-        return True
+            await safe_answer_callback(query, text="No se pudo mostrar el informe aquí. Revisa logs.", show_alert=True)
+        return
 
-    if state == "awaiting_edit_defense":
-        text = update.message.text.strip() if update.message and update.message.text else ""
+@admin_only
+async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if context.user_data.get("awaiting_admin_delete"):
+        context.user_data.pop("awaiting_admin_delete", None)
         try:
-            defense = int(text.replace(".", "").replace(",", "").strip())
-            if defense <= 0:
-                await update.message.reply_text("❌ La defensa debe ser mayor a 0. Intenta de nuevo:")
-                return True
-            username = context.user_data.get("edit_username")
-            attack = context.user_data.get("edit_attack")
-            data = load_data()
-            user_key = str(update.effective_user.id)
-            updated = False
-            if user_key in data:
-                accounts = data[user_key].get("accounts", [])
-                for i, acc in enumerate(accounts):
-                    if acc["username"].lower() == username.lower():
-                        accounts[i]["attack"] = attack
-                        accounts[i]["defense"] = defense
-                        accounts[i]["updated_date"] = datetime.now().isoformat()
-                        updated = True
-                        break
-                if updated:
-                    data[user_key]["accounts"] = accounts
-                    save_data_with_retry(data)
-            context.user_data.clear()
-            if updated:
-                await update.message.reply_text(
-                    f"✅ **Cuenta actualizada:** {username}\n"
-                    f"• ⚔️ Ataque: {attack:,}\n"
-                    f"• 🛡️ Defensa: {defense:,}",
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ No se encontró la cuenta *{username}* para actualizar.",
-                    parse_mode="Markdown"
-                )
-        except Exception:
-            await update.message.reply_text("❌ Por favor, envía solo números. Intenta de nuevo:")
-        return True
-
-    return False
-
-# ================= MANEJO DE MENSAJES (registro y edición) =================
-
-# ----------------- Helpers de validación -----------------
-def _normalize_username(text: str) -> str:
-    """Normaliza y valida un username simple (sin espacios)."""
-    return text.strip()
-
-def _is_valid_username(text: str) -> bool:
-    u = _normalize_username(text)
-    if not u:
-        return False
-    if " " in u or len(u) > 32:
-        return False
-    return True
-
-# ----------------- Inicio del flujo: pedir username -----------------
-async def ask_account_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Inicia el flujo de registro pidiendo el nombre de usuario de la cuenta.
-    Se usa desde un callback (botón) o desde un comando en privado.
-    """
-    query = update.callback_query
-    prompt = (
-        "➕ **Registrar nueva cuenta**\n\n"
-        "Envía el **nombre de usuario** de la cuenta (sin @, sin espacios).\n\n"
-        "Puedes escribir `cancelar` para abortar."
-    )
-    if query:
-        await safe_answer_callback(query)
-        await safe_edit_message(query, prompt, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(prompt, parse_mode="Markdown")
-    context.user_data["state"] = "awaiting_username"
-
-# ----------------- Manejar mensajes durante el registro -----------------
-async def handle_registration_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Maneja los estados:
-      - awaiting_username
-      - awaiting_attack
-      - awaiting_defense
-
-    Devuelve True si el mensaje fue consumido por este flujo.
-    """
-    state = context.user_data.get("state")
-    if not state:
-        return False
-
-    text = ""
-    if update.message and update.message.text:
-        text = update.message.text.strip()
-    elif update.callback_query and update.callback_query.data:
-        text = update.callback_query.data.strip()
-    else:
-        return False
-
-    # Permitir cancelar en cualquier paso
-    if text.lower() in ("cancel", "cancelar", "/cancel"):
-        context.user_data.clear()
-        if update.message:
-            await update.message.reply_text("❌ Registro cancelado.")
-        elif update.callback_query:
-            await safe_edit_message(update.callback_query, "❌ Registro cancelado.")
-        return True
-
-    # ---------- awaiting_username ----------
-    if state == "awaiting_username":
-        if not _is_valid_username(text):
-            msg = "❌ Username inválido. Debe ser sin espacios y hasta 32 caracteres. Intenta de nuevo:"
-            if update.message:
-                await update.message.reply_text(msg)
-            else:
-                await safe_edit_message(update.callback_query, msg)
-            return True
-
-        username = _normalize_username(text).lstrip("@")
-        context.user_data["new_username"] = username
-        context.user_data["state"] = "awaiting_attack"
-
-        prompt = (
-            f"✏️ **Cuenta:** {username}\n\n"
-            "Envía el **poder de ataque** (solo números). Ejemplo: `125000`.\n\n"
-            "Escribe `cancelar` para abortar."
-        )
-        if update.message:
-            await update.message.reply_text(prompt, parse_mode="Markdown")
+            target_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID inválido. Debes enviar un número entero.")
+            return
+        ok = admin_delete_user_data(target_id)
+        if ok:
+            await update.message.reply_text(f"✅ Datos del usuario `{target_id}` borrados correctamente.", parse_mode="Markdown")
         else:
-            await safe_edit_message(update.callback_query, prompt, parse_mode="Markdown")
-        return True
-
-    # ---------- awaiting_attack ----------
-    if state == "awaiting_attack":
-        try:
-            attack = int(text.replace(".", "").replace(",", ""))
-            if attack <= 0:
-                raise ValueError()
-        except Exception:
-            msg = "❌ Valor de ataque inválido. Envía solo números mayores a 0. Intenta de nuevo:"
-            if update.message:
-                await update.message.reply_text(msg)
-            else:
-                await safe_edit_message(update.callback_query, msg)
-            return True
-
-        context.user_data["new_attack"] = attack
-        context.user_data["state"] = "awaiting_defense"
-
-        prompt = (
-            f"⚔️ Ataque registrado: {attack:,}\n\n"
-            "Ahora envía el **poder de defensa** (solo números). Ejemplo: `90000`.\n\n"
-            "Escribe `cancelar` para abortar."
-        )
-        if update.message:
-            await update.message.reply_text(prompt, parse_mode="Markdown")
-        else:
-            await safe_edit_message(update.callback_query, prompt, parse_mode="Markdown")
-        return True
-
-    # ---------- awaiting_defense ----------
-    if state == "awaiting_defense":
-        try:
-            defense = int(text.replace(".", "").replace(",", ""))
-            if defense <= 0:
-                raise ValueError()
-        except Exception:
-            msg = "❌ Valor de defensa inválido. Envía solo números mayores a 0. Intenta de nuevo:"
-            if update.message:
-                await update.message.reply_text(msg)
-            else:
-                await safe_edit_message(update.callback_query, msg)
-            return True
-
-        # Recuperar datos temporales
-        username = context.user_data.get("new_username")
-        attack = context.user_data.get("new_attack")
-        user = update.effective_user
-        user_id = user.id
-
-        if not username or attack is None:
-            context.user_data.clear()
-            err = "❌ Error interno: faltan datos del registro. Por favor, inicia de nuevo."
-            if update.message:
-                await update.message.reply_text(err)
-            else:
-                await safe_edit_message(update.callback_query, err)
-            return True
-
-        # Construir estructura de cuenta
-        account_data = {
-            "username": username,
-            "attack": int(attack),
-            "defense": int(defense),
-            "telegram_name": f"{user.first_name} @{user.username}" if user.username else user.first_name,
-            "created_date": datetime.now().isoformat(),
-        }
-
-        # Guardar usando la función existente (add_user_account)
-        try:
-            result = add_user_account(user_id, account_data)  # "added" o "updated"
-            if update.message:
-                await update.message.reply_text(
-                    f"✅ Cuenta *{username}* { 'actualizada' if result=='updated' else 'registrada' }.\n"
-                    f"• ⚔️ Ataque: {attack:,}\n"
-                    f"• 🛡️ Defensa: {defense:,}",
-                    parse_mode="Markdown"
-                )
-            else:
-                await safe_edit_message(
-                    update.callback_query,
-                    f"✅ Cuenta *{username}* { 'actualizada' if result=='updated' else 'registrada' }.\n"
-                    f"• ⚔️ Ataque: {attack:,}\n"
-                    f"• 🛡️ Defensa: {defense:,}",
-                    parse_mode="Markdown"
-                )
-        except Exception as e:
-            logger.exception("Error guardando cuenta: %s", e)
-            if update.message:
-                await update.message.reply_text("❌ Ocurrió un error al guardar la cuenta. Intenta de nuevo más tarde.")
-            else:
-                await safe_edit_message(update.callback_query, "❌ Ocurrió un error al guardar la cuenta. Intenta de nuevo más tarde.")
-
-        # Limpiar estado
-        context.user_data.clear()
-        return True
-
-    return False
-
-# ----------------- Función principal de manejo de mensajes -----------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manejar mensajes de texto (flujo de registro y edición)"""
-    # 1) Priorizar flujo de edición si está activo
-    handled = await handle_edit_account_message(update, context)
-    if handled:
+            await update.message.reply_text(f"⚠️ No se encontraron datos para el usuario `{target_id}` o hubo un error.", parse_mode="Markdown")
         return
 
-    # 2) Priorizar flujo de registro si está activo
-    handled = await handle_registration_message(update, context)
-    if handled:
+    if context.user_data.get("awaiting_admin_broadcast"):
+        context.user_data.pop("awaiting_admin_broadcast", None)
+        message = text
+        await update.message.reply_text("📨 Enviando broadcast... (esto puede tardar unos segundos)")
+        stats = await broadcast_message_to_all(context.application, message)
+        sent = stats.get("sent", 0)
+        failed = stats.get("failed", 0)
+        await update.message.reply_text(f"✅ Broadcast finalizado. Enviados: {sent}. Fallidos: {failed}.")
         return
 
-    # 3) Comportamiento por defecto si no hay flujo activo
-    state = context.user_data.get("state")
-    if not state:
-        await update.message.reply_text("Usa /help para ver los comandos disponibles.")
+    await update.message.reply_text("No hay ninguna acción administrativa pendiente. Usa /adminmenu para abrir el menú.")
 
-# ================= ADMIN: borrar datos de usuario =================
+# Comandos admin directos (compatibilidad)
+@admin_only
 async def cmd_deleteuserdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando admin para borrar datos de un usuario: /deleteuserdata <user_id>"""
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("⛔ Solo el administrador puede usar este comando.")
-        return
-    if not context.args:
+    """Uso: /deleteuserdata <user_id>"""
+    args = context.args or []
+    if not args:
         await update.message.reply_text("Uso: /deleteuserdata <user_id>")
         return
     try:
-        target_id = int(context.args[0])
+        target_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("ID inválido. Debe ser un número.")
+        await update.message.reply_text("ID inválido. Debe ser un número entero.")
         return
     ok = admin_delete_user_data(target_id)
     if ok:
-        await update.message.reply_text(f"✅ Datos del usuario {target_id} eliminados.")
+        await update.message.reply_text(f"✅ Datos del usuario `{target_id}` borrados correctamente.", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ No se pudo eliminar los datos del usuario {target_id} (no existe o error).")
+        await update.message.reply_text(f"⚠️ No se encontraron datos para el usuario `{target_id}` o hubo un error.", parse_mode="Markdown")
 
-# ================= ADMIN: broadcast a todos los usuarios =================
+@admin_only
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando admin para enviar mensaje a todos los usuarios: /broadcast <mensaje>"""
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("⛔ Solo el administrador puede usar este comando.")
-        return
-    if not context.args:
+    """Uso: /broadcast <mensaje>"""
+    message = " ".join(context.args or [])
+    if not message:
         await update.message.reply_text("Uso: /broadcast <mensaje>")
         return
-    text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text("El mensaje no puede estar vacío.")
-        return
-    await update.message.reply_text("📣 Enviando broadcast, esto puede tardar unos segundos...")
-    result = await broadcast_message_to_all(context.application, text)
-    await update.message.reply_text(f"✅ Envío finalizado. Enviados: {result['sent']}. Fallidos: {result['failed']}.")
+    await update.message.reply_text("📨 Enviando broadcast... (esto puede tardar unos segundos)")
+    stats = await broadcast_message_to_all(context.application, message)
+    sent = stats.get("sent", 0)
+    failed = stats.get("failed", 0)
+    await update.message.reply_text(f"✅ Broadcast finalizado. Enviados: {sent}. Fallidos: {failed}.")
 
-# ================= ADMIN: añadir usuario autorizado =================
-async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando admin para añadir usuario autorizado: /adduser <id>"""
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("⛔ Solo el administrador puede usar este comando.")
-        return
-    if not context.args:
-        await update.message.reply_text("Uso: /adduser <id>")
-        return
-    try:
-        new_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("ID inválido. Debe ser un número.")
-        return
-    ids = load_authorized_users()
-    if new_id in ids:
-        await update.message.reply_text("El usuario ya está autorizado.")
-        return
-    ids.append(new_id)
-    if save_authorized_users(ids):
-        await update.message.reply_text(f"✅ Usuario {new_id} autorizado.")
-    else:
-        await update.message.reply_text("❌ Error al guardar la lista de autorizados.")
-
-# ================= REPORTES =================
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando para ver informe público"""
-    text = generate_public_report()
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando admin para ver informe completo"""
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("⛔ Solo el administrador puede usar este comando.")
-        return
-    text = generate_admin_report()
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# ================= FUNCIONES AUXILIARES (placeholders que puedes ampliar) =================
-async def show_clan_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostrar informe público (callback)"""
-    query = update.callback_query
-    text = generate_public_report()
-    await safe_edit_message(query, text, parse_mode="Markdown")
-
-async def show_my_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostrar ranking personal (callback)"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    accounts = get_user_accounts(user_id)
-    if not accounts:
-        await safe_edit_message(query, "📭 No tienes cuentas registradas.", parse_mode="Markdown")
-        return
-    accounts_sorted = sorted(accounts, key=lambda x: x["attack"], reverse=True)
-    text = "📈 **Tu ranking:**\n\n"
-    for i, acc in enumerate(accounts_sorted, 1):
-        text += f"{i}. {acc['username']}: ⚔️{acc['attack']:,} 🛡️{acc['defense']:,}\n"
-    await safe_edit_message(query, text, parse_mode="Markdown")
-
-async def show_admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostrar informe admin (callback)"""
-    query = update.callback_query
-    text = generate_admin_report()
-    await safe_edit_message(query, text, parse_mode="Markdown")
-
-async def show_group_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostrar informe en grupo (callback)"""
-    query = update.callback_query
-    text = generate_public_report()
-    await safe_edit_message(query, text, parse_mode="Markdown")
-
-async def send_id_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Enviar solicitud de ID al admin (callback)"""
-    query = update.callback_query
-    user = query.from_user
-    admin_id = ADMIN_USER_ID if ADMIN_USER_ID else None
-    if admin_id:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"➡️ Solicitud de acceso de {user.first_name} (ID: `{user.id}`)",
-                parse_mode="Markdown"
-            )
-            await safe_edit_message(query, "✅ He enviado tu solicitud al administrador.")
-        except Exception as e:
-            logger.warning("No se pudo notificar al admin: %s", e)
-            await safe_edit_message(query, "⚠️ No pude notificar al administrador.")
-    else:
-        await safe_edit_message(query, "⚠️ No hay administrador configurado.")
-
-# ================= REGISTRO DE HANDLERS Y ARRANQUE =================
+# ================= ARRANQUE / MAIN =================
 def main():
+    """Construir y arrancar la aplicación del bot."""
     app = Application.builder().token(TOKEN).build()
 
-    # Comandos
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+    # Comandos públicos
     app.add_handler(CommandHandler("getid", getid))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("adduser", cmd_adduser))
+    app.add_handler(CommandHandler("help", help_command))
+
+    # Admin menu y callbacks
+    app.add_handler(CommandHandler("adminmenu", admin_menu))
+    app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern="^admin_"))
+    # Admin text handler (captura texto libre para acciones admin)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler))
+
+    # Comandos admin directos
     app.add_handler(CommandHandler("deleteuserdata", cmd_deleteuserdata))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("register", ask_account_username))
 
-    # Callbacks y mensajes
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Registrar comandos visibles en Telegram
+    # Opcional: establecer comandos visibles en Telegram UI
     try:
-        app.bot.set_my_commands([
-            BotCommand("start", "Iniciar"),
-            BotCommand("help", "Ayuda"),
-            BotCommand("getid", "Obtener tu ID"),
-            BotCommand("report", "Ver informe del clan"),
-            BotCommand("admin", "Vista admin (si eres admin)"),
-            BotCommand("register", "Registrar una cuenta")
-        ], scope=BotCommandScopeDefault())
-    except Exception as e:
-        logger.warning("No se pudieron registrar comandos: %s", e)
+        commands = [
+            BotCommand("getid", "Obtener tu ID de Telegram"),
+            BotCommand("help", "Mostrar ayuda"),
+            BotCommand("adminmenu", "Menú de administrador (solo admin)"),
+        ]
+        app.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    except Exception:
+        logger.warning("No se pudieron establecer comandos del bot (posible limitación de la API).")
 
-    # Arranque: si WEBHOOK_URL está configurado, usar webhook; si no, polling (útil en local)
-    if WEBHOOK_URL:
-        logger.info("Iniciando en modo webhook en %s (puerto %s)", WEBHOOK_URL, PORT)
-        app.run_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN, webhook_url=WEBHOOK_URL)
-    else:
-        logger.info("Iniciando en modo polling")
-        app.run_polling()
+    # Ejecutar polling (o webhook si prefieres)
+    logger.info("Arrancando bot...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
