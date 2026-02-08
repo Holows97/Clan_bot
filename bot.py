@@ -1130,6 +1130,82 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Usuario {uid} autorizado.")
 
 # ===================== REGISTRO DE HANDLERS Y ARRANQUE =====================
+# --- INICIO BLOQUE: vista paginada de cuentas + handler de paginación ---
+@restricted
+async def send_accounts_list_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Muestra/edita la lista de cuentas del usuario con paginación.
+    Si se llama desde callback_query, edita el mensaje; si se llama desde comando, envía nuevo mensaje.
+    """
+    user = update.effective_user
+    user_id = user.id
+    accounts = get_user_accounts(user_id)
+    per_page = 6
+    page = int(context.user_data.get("accounts_page", 1))
+    total = len(accounts)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    context.user_data["accounts_page"] = page
+
+    start = (page - 1) * per_page
+    end = start + per_page
+    slice_accounts = accounts[start:end]
+
+    if not accounts:
+        text = "📭 No tienes cuentas registradas."
+        keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+        reply = InlineKeyboardMarkup(keyboard)
+        if update.callback_query:
+            await safe_edit(update.callback_query, text, reply_markup=reply)
+        else:
+            await update.message.reply_text(text, reply_markup=reply)
+        return
+
+    text = f"📂 **Tus cuentas ({total}):**\n\n"
+    for acc in slice_accounts:
+        text += f"- **{acc['username']}**: ⚔️ {acc['attack']:,}  🛡️ {acc['defense']:,}\n"
+
+    keyboard = []
+    for acc in slice_accounts:
+        keyboard.append([
+            InlineKeyboardButton(f"✏️ Editar {acc['username']}", callback_data=f"edit_account:{acc['username']}"),
+            InlineKeyboardButton(f"🗑️ Eliminar {acc['username']}", callback_data=f"delete_account:{acc['username']}")
+        ])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data="accounts_prev"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("Siguiente ➡️", callback_data="accounts_next"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("↩️ Volver", callback_data="menu_back")])
+    reply = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await safe_edit(update.callback_query, text, reply_markup=reply, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=reply, parse_mode="Markdown")
+
+@restricted_callback
+async def callback_accounts_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Maneja los botones de paginación de la lista de cuentas:
+    - accounts_next  -> siguiente página
+    - accounts_prev  -> página anterior
+    Re-renderiza la lista llamando a send_accounts_list_for_edit.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    page = int(context.user_data.get("accounts_page", 1))
+    if data == "accounts_next":
+        context.user_data["accounts_page"] = page + 1
+    elif data == "accounts_prev":
+        context.user_data["accounts_page"] = max(1, page - 1)
+    await send_accounts_list_for_edit(update, context)
+# --- FIN BLOQUE ---
 def main():
     application = Application.builder().token(TOKEN).build()
 
