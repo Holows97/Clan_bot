@@ -7,27 +7,8 @@ BOT DEL CLAN - Versión actualizada (correcciones)
 - Cierra cadenas multilínea y completa help_command.
 - Mejora manejo de GitHub con fallback de decodificación.
 - Añade main() con registro de handlers.
-- Manejo seguro de CallbackQuery
-- Mejoras en llamadas a GitHub (timeout, headers)
-- Comando admin: /deleteuserdata <user_id>
-- Comando admin: /broadcast <mensaje>
-- Flujo de registro completo (awaiting_username, awaiting_attack, awaiting_defense)
-- Flujo de edición de cuentas (awaiting_edit_attack, awaiting_edit_defense)
-- Comandos admin: /deleteuserdata <user_id>, /broadcast <mensaje>, /adduser <id>
-- Robustez en operaciones con GitHub y Telegram
-
-VARIABLES DE ENTORNO NECESARIAS:
-- TOKEN
-- ADMIN_USER_ID
-- ADMIN_USERNAME (opcional)
-- WEBHOOK_URL
-- PORT (opcional, por defecto 8443)
-- GITHUB_TOKEN
-- GITHUB_OWNER
-- GITHUB_REPO
-- GITHUB_DATA_PATH (opcional, por defecto data/clan_data.json)
-- GITHUB_AUTH_PATH (opcional, por defecto data/authorized_users.json)
 """
+
 import os
 import json
 import logging
