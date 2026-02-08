@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BOT DEL CLAN - Versión para Render (webhook) con persistencia en GitHub
-Variables de entorno necesarias:
-- TOKEN
-- ADMIN_USER_ID
-- ADMIN_USERNAME (opcional)
-- WEBHOOK_URL
-- PORT (opcional, por defecto 8443)
-- GITHUB_TOKEN
-- GITHUB_OWNER
-- GITHUB_REPO
-- GITHUB_DATA_PATH (opcional, por defecto data/clan_data.json)
-- GITHUB_AUTH_PATH (opcional, por defecto data/authorized_users.json)
+BOT DEL CLAN - Versión corregida (callbacks y navegación)
+Incluye correcciones en los handlers de CallbackQuery y un único MessageHandler
+que enruta mensajes según el estado (edición estructurada / broadcast).
 """
-
 import os
 import json
 import logging
@@ -49,7 +39,7 @@ if not TOKEN:
 
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")  # opcional
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Ej: https://mi-servicio.onrender.com/<token>
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", "8443"))
 
 # GitHub storage config
@@ -74,7 +64,6 @@ HEADERS = {
 }
 
 def _get_file_from_github(path):
-    """Devuelve (content:str, sha:str) o (None, None) si no existe."""
     if not (GITHUB_OWNER and GITHUB_REPO):
         raise RuntimeError("GITHUB_OWNER y GITHUB_REPO deben estar configurados.")
     url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
@@ -89,7 +78,6 @@ def _get_file_from_github(path):
     r.raise_for_status()
 
 def _put_file_to_github(path, content_str, sha=None, message=None):
-    """Crea o actualiza archivo. content_str es texto (JSON)."""
     if not (GITHUB_OWNER and GITHUB_REPO):
         raise RuntimeError("GITHUB_OWNER y GITHUB_REPO deben estar configurados.")
     url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
@@ -107,7 +95,6 @@ def _put_file_to_github(path, content_str, sha=None, message=None):
 
 # ================= FUNCIONES DE DATOS (GITHUB) =================
 def load_data():
-    """Carga clan_data.json desde GitHub; devuelve dict vacío si no existe o error."""
     try:
         content, sha = _get_file_from_github(GITHUB_DATA_PATH)
         if content is None:
@@ -118,7 +105,6 @@ def load_data():
         return {}
 
 def save_data(data):
-    """Guarda el dict 'data' en GitHub en GITHUB_DATA_PATH. Retorna True/False."""
     try:
         content, sha = _get_file_from_github(GITHUB_DATA_PATH)
         new_content = json.dumps(data, ensure_ascii=False, indent=2)
@@ -129,7 +115,6 @@ def save_data(data):
         return False
 
 def load_authorized_users():
-    """Carga authorized_users.json desde GitHub; si no existe devuelve [ADMIN_USER_ID]."""
     try:
         content, sha = _get_file_from_github(GITHUB_AUTH_PATH)
         if content is None:
@@ -141,7 +126,6 @@ def load_authorized_users():
         return [ADMIN_USER_ID]
 
 def save_authorized_users(user_ids):
-    """Guarda la lista de user_ids en GitHub. Retorna True/False."""
     try:
         content, sha = _get_file_from_github(GITHUB_AUTH_PATH)
         new_content = json.dumps({"authorized_ids": user_ids}, ensure_ascii=False, indent=2)
@@ -152,7 +136,6 @@ def save_authorized_users(user_ids):
         return False
 
 def save_data_with_retry(data, retries=3, delay=0.5):
-    """Helper con reintentos para reducir conflictos simples."""
     for attempt in range(retries):
         try:
             return save_data(data)
@@ -171,12 +154,10 @@ def save_data_with_retry(data, retries=3, delay=0.5):
 
 # ================= FUNCIONES DE NEGOCIO =================
 def get_user_accounts(user_id):
-    """Obtener cuentas de un usuario desde GitHub-backed JSON."""
     data = load_data()
     return data.get(str(user_id), {}).get("accounts", [])
 
 def add_user_account(user_id, account_data):
-    """Añadir o actualizar cuenta de usuario en el JSON almacenado en GitHub."""
     data = load_data()
     user_id_str = str(user_id)
     if user_id_str not in data:
@@ -197,7 +178,6 @@ def add_user_account(user_id, account_data):
     return "added"
 
 def delete_user_account(user_id, username):
-    """Eliminar cuenta de usuario y persistir en GitHub."""
     data = load_data()
     user_id_str = str(user_id)
     if user_id_str in data:
@@ -211,7 +191,6 @@ def delete_user_account(user_id, username):
 
 # ================= FUNCIONES DE INFORME =================
 def generate_public_report():
-    """Generar informe público (sin dueños visibles)"""
     data = load_data()
     if not data:
         return "📭 **No hay datos registrados aún.**"
@@ -247,7 +226,6 @@ def generate_public_report():
     return report
 
 def generate_admin_report():
-    """Generar informe para administrador"""
     data = load_data()
     if not data:
         return "📭 **No hay datos registrados aún.**"
@@ -281,7 +259,6 @@ def generate_admin_report():
 
 # ================= DECORADORES =================
 def restricted(func):
-    """Decorador para restringir comandos"""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not is_user_authorized(user_id):
@@ -300,7 +277,6 @@ def restricted(func):
     return wrapper
 
 def restricted_callback(func):
-    """Decorador para restringir callbacks"""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = query.from_user.id
@@ -312,22 +288,17 @@ def restricted_callback(func):
 
 # ================= UTILIDADES DE AUTORIZACIÓN =================
 def is_user_authorized(user_id):
-    """Verificar si usuario está autorizado"""
     authorized_ids = load_authorized_users()
     return user_id in authorized_ids
 
 def is_admin(user_id):
-    """Verificar si es administrador"""
     return user_id == ADMIN_USER_ID
 
 # ================= COMANDOS PÚBLICOS =================
 async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Obtener ID de usuario, enviar automáticamente al admin y mostrar botón de contacto."""
     user = update.effective_user
-
     admin_username = ADMIN_USERNAME
     admin_id = ADMIN_USER_ID if ADMIN_USER_ID != 0 else None
-
     user_text = (
         f"👤 **Tu ID de Telegram:**\n"
         f"`{user.id}`\n\n"
@@ -336,16 +307,13 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📬 He enviado tu ID al administrador para que te autorice. "
         "Por favor, espera la confirmación."
     )
-
     sent_to_admin = False
     admin_contact_url = None
-
     if admin_username:
         admin_username = admin_username.lstrip("@")
         admin_contact_url = f"https://t.me/{admin_username}"
     elif admin_id:
         admin_contact_url = f"tg://user?id={admin_id}"
-
     if admin_id:
         try:
             await context.bot.send_message(
@@ -362,7 +330,6 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_to_admin = True
         except Exception as e:
             logger.warning("No se pudo enviar la solicitud al admin por ID: %s", e)
-
     if not sent_to_admin and admin_username:
         try:
             await context.bot.send_message(
@@ -379,7 +346,6 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_to_admin = True
         except Exception as e:
             logger.warning("No se pudo enviar la solicitud al admin por username: %s", e)
-
     if admin_contact_url:
         keyboard = [[InlineKeyboardButton("✉️ Contactar al admin", url=admin_contact_url)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -388,7 +354,6 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_display = str(ADMIN_USER_ID) if ADMIN_USER_ID else "No configurado"
         extra = f"\n\nID del admin: `{admin_display}`"
         await update.message.reply_text(user_text + extra, parse_mode="Markdown")
-
     if not sent_to_admin:
         try:
             await update.message.reply_text(
@@ -400,7 +365,6 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando de ayuda"""
     help_text = """
 🧭 **BOT DEL CLAN - AYUDA** 🧭
 
@@ -408,7 +372,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 **Para todos:**
 /start - Iniciar el bot
-/getid - Obtener tu ID de Telegram
+/getid - Obtener tu ID
 /help - Mostrar esta ayuda
 
 **Para miembros autorizados:**
@@ -424,7 +388,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= MANEJO DE START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando start - diferenciado por tipo de chat"""
     user = update.effective_user
     chat_type = update.effective_chat.type
     if chat_type == "private":
@@ -433,10 +396,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_group_start(update, context)
 
 async def handle_private_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start en chat privado (funciona con message o callback_query)"""
     query = update.callback_query
     user = update.effective_user
-
     if not is_user_authorized(user.id):
         keyboard = [[InlineKeyboardButton("📤 Enviar ID al admin", callback_data="send_id_request")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -453,7 +414,6 @@ async def handle_private_start(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         return
-
     accounts = get_user_accounts(user.id)
     keyboard = [
         [
@@ -468,7 +428,6 @@ async def handle_private_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if is_admin(user.id):
         keyboard.append([InlineKeyboardButton("🧾 Vista Admin", callback_data="admin_menu")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     welcome_text = f"¡Hola {user.first_name}! 👋\n\n"
     welcome_text += "🏰 **Bot del Clan** 🏰\n\n"
     if accounts:
@@ -482,7 +441,6 @@ async def handle_private_start(update: Update, context: ContextTypes.DEFAULT_TYP
         welcome_text += "📭 Aún no tienes cuentas registradas.\n"
         welcome_text += "¡Añade tu primera cuenta!\n\n"
     welcome_text += "Selecciona una opción:"
-
     if query:
         await query.answer()
         await query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
@@ -490,10 +448,8 @@ async def handle_private_start(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def handle_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start en grupo (funciona con message o callback_query)"""
     query = update.callback_query
     user = update.effective_user
-
     keyboard = [
         [
             InlineKeyboardButton("💬 Ir al privado", url=f"https://t.me/{context.bot.username}?start=menu"),
@@ -503,7 +459,6 @@ async def handle_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if is_admin(user.id):
         keyboard.append([InlineKeyboardButton("🧾 Admin", callback_data="group_admin")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     text = (
         f"Hola {user.first_name}! 👋\n\n"
         "Este bot gestiona las cuentas del clan. Usa el botón para abrir el menú privado."
@@ -514,33 +469,30 @@ async def handle_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text(text, reply_markup=reply_markup)
 
-# ===================== NUEVAS FUNCIONES SOLICITADAS =====================
-# Flujo de edición más estructurado: pedir ataque y luego defensa por separado.
+# ===================== FUNCIONES DE EDICIÓN / ADMIN / BROADCAST =====================
 # Estados en context.user_data:
 # - editing_account: username en edición
 # - edit_step: "attack" o "defense"
 # - pending_attack: valor temporal
+# - awaiting_broadcast: True/False
+# - accounts_page, admin_users_page
 
-# Mostrar lista de cuentas del usuario con botones para editar/eliminar (paginada si muchas)
 @restricted
 async def send_accounts_list_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Puede ser llamado por comando o por re-render desde callbacks
     user = update.effective_user
     accounts = get_user_accounts(user.id)
     if not accounts:
         await update.message.reply_text("No tienes cuentas registradas.")
         return
-
-    # Paginación simple: 6 cuentas por página
     page = int(context.user_data.get("accounts_page", 1))
     per_page = 6
     total_pages = max(1, ceil(len(accounts) / per_page))
     page = max(1, min(page, total_pages))
     context.user_data["accounts_page"] = page
-
     start = (page - 1) * per_page
     end = start + per_page
     slice_accounts = accounts[start:end]
-
     keyboard = []
     for acc in slice_accounts:
         username = acc["username"]
@@ -548,7 +500,6 @@ async def send_accounts_list_for_edit(update: Update, context: ContextTypes.DEFA
             InlineKeyboardButton(f"✏️ Editar {username}", callback_data=f"edit_account:{username}"),
             InlineKeyboardButton(f"🗑️ Eliminar {username}", callback_data=f"delete_account:{username}")
         ])
-
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data="accounts_prev"))
@@ -557,29 +508,30 @@ async def send_accounts_list_for_edit(update: Update, context: ContextTypes.DEFA
     if nav:
         keyboard.append(nav)
     keyboard.append([InlineKeyboardButton("↩️ Volver", callback_data="menu_back")])
-
-    await update.message.reply_text(
-        f"Selecciona la cuenta que quieres editar o eliminar (Página {page}/{total_pages}):",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # Si fue llamado por callback, editar; si por comando, enviar nuevo mensaje
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            f"Selecciona la cuenta que quieres editar o eliminar (Página {page}/{total_pages}):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            f"Selecciona la cuenta que quieres editar o eliminar (Página {page}/{total_pages}):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 @restricted_callback
 async def callback_accounts_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    page = int(context.user_data.get("accounts_page", 1))
-    if data == "accounts_next":
-        context.user_data["accounts_page"] = page + 1
-    elif data == "accounts_prev":
-        context.user_data["accounts_page"] = max(1, page - 1)
-    # Reusar la función para enviar la lista (simulamos llamada)
-    await query.edit_message_text("Actualizando lista...")
-    # Llamamos a la función que envía la lista como si fuera un mensaje nuevo
-    # No podemos llamar send_accounts_list_for_edit directamente con update.message, así que respondemos con nuevo mensaje
+    if query.data == "accounts_next":
+        context.user_data["accounts_page"] = int(context.user_data.get("accounts_page", 1)) + 1
+    elif query.data == "accounts_prev":
+        context.user_data["accounts_page"] = max(1, int(context.user_data.get("accounts_page", 1)) - 1)
+    # Re-renderizar la lista editando el mensaje actual
     await send_accounts_list_for_edit(update, context)
 
-# Iniciar edición: guardar estado y pedir ataque
 @restricted_callback
 async def callback_edit_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -591,6 +543,7 @@ async def callback_edit_account_start(update: Update, context: ContextTypes.DEFA
         return
     context.user_data["editing_account"] = username
     context.user_data["edit_step"] = "attack"
+    # Pedimos ataque
     await query.edit_message_text(
         f"Has elegido editar **{username}**.\n\n"
         "Primero, envía el nuevo valor de **ataque** (solo el número).\n"
@@ -598,21 +551,19 @@ async def callback_edit_account_start(update: Update, context: ContextTypes.DEFA
         parse_mode="Markdown"
     )
 
-# Recibir valores paso a paso (ataque luego defensa)
 @restricted
 async def handle_structured_edit_values(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    # Este handler solo procesa si estamos en modo edición estructurada
     if "editing_account" not in context.user_data or "edit_step" not in context.user_data:
-        return  # no estamos en modo edición estructurada
+        return False  # Indica que no procesó el mensaje
+    user = update.effective_user
     step = context.user_data.get("edit_step")
     text = update.message.text.strip()
-    # Validar número
     try:
         value = int(text.replace(",", ""))
     except ValueError:
         await update.message.reply_text("Valor inválido. Envía un número entero.")
-        return
-
+        return True
     if step == "attack":
         context.user_data["pending_attack"] = value
         context.user_data["edit_step"] = "defense"
@@ -620,7 +571,7 @@ async def handle_structured_edit_values(update: Update, context: ContextTypes.DE
             f"Ataque registrado temporalmente: {value:,}\n\nAhora envía el nuevo valor de **defensa** (solo el número).",
             parse_mode="Markdown"
         )
-        return
+        return True
     elif step == "defense":
         attack = context.user_data.pop("pending_attack", None)
         defense = value
@@ -628,8 +579,7 @@ async def handle_structured_edit_values(update: Update, context: ContextTypes.DE
         context.user_data.pop("edit_step", None)
         if username is None or attack is None:
             await update.message.reply_text("Estado de edición perdido. Intenta de nuevo.")
-            return
-        # Actualizar en GitHub
+            return True
         data = load_data()
         user_id_str = str(user.id)
         updated = False
@@ -648,10 +598,11 @@ async def handle_structured_edit_values(update: Update, context: ContextTypes.DE
                     f"Cuenta **{username}** actualizada: Ataque {attack:,}, Defensa {defense:,}.",
                     parse_mode="Markdown"
                 )
-                return
+                return True
         await update.message.reply_text("No encontré la cuenta para actualizar. Asegúrate de que existe.")
+        return True
+    return False
 
-# Eliminar cuenta propia con confirmación
 @restricted_callback
 async def callback_delete_own_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -661,7 +612,6 @@ async def callback_delete_own_account(update: Update, context: ContextTypes.DEFA
     except Exception:
         await query.edit_message_text("Dato inválido.")
         return
-    # Pedir confirmación
     context.user_data["confirm_delete_account"] = username
     keyboard = [
         [InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"confirm_delete_account:{username}")],
@@ -697,8 +647,7 @@ async def callback_cancel_delete_account(update: Update, context: ContextTypes.D
     context.user_data.pop("confirm_delete_account", None)
     await query.edit_message_text("Eliminación cancelada.", parse_mode="Markdown")
 
-# ------------------ MENÚ ADMIN: ver usuarios, eliminar y broadcast ------------------
-
+# ------------------ MENÚ ADMIN ------------------
 @restricted
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Puede ser llamado por comando o callback
@@ -711,26 +660,19 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not users:
         await update.message.reply_text("No hay usuarios registrados.")
         return
-
-    # Paginación de usuarios: 8 por página
     page = int(context.user_data.get("admin_users_page", 1))
     per_page = 8
     total_pages = max(1, ceil(len(users) / per_page))
     page = max(1, min(page, total_pages))
     context.user_data["admin_users_page"] = page
-
     start = (page - 1) * per_page
     end = start + per_page
     slice_users = users[start:end]
-
     keyboard = []
-    # Botón para mensaje global
     keyboard.append([InlineKeyboardButton("📣 Enviar mensaje global", callback_data="admin_broadcast")])
-    # Listar usuarios (mostrar nombre o ID)
     for user_id_str, user_data in slice_users:
         display = user_data.get("telegram_name", f"User {user_id_str}")
         keyboard.append([InlineKeyboardButton(f"🧑 {display}", callback_data=f"admin_user:{user_id_str}")])
-
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data="admin_users_prev"))
@@ -738,9 +680,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nav.append(InlineKeyboardButton("Siguiente ➡️", callback_data="admin_users_next"))
     if nav:
         keyboard.append(nav)
-
     keyboard.append([InlineKeyboardButton("↩️ Volver", callback_data="menu_back")])
-    # Si llamado por comando, enviar nuevo mensaje; si por callback, editar
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text("Menú administrador:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -751,12 +691,10 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_admin_users_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    page = int(context.user_data.get("admin_users_page", 1))
-    if data == "admin_users_next":
-        context.user_data["admin_users_page"] = page + 1
-    elif data == "admin_users_prev":
-        context.user_data["admin_users_page"] = max(1, page - 1)
+    if query.data == "admin_users_next":
+        context.user_data["admin_users_page"] = int(context.user_data.get("admin_users_page", 1)) + 1
+    elif query.data == "admin_users_prev":
+        context.user_data["admin_users_page"] = max(1, int(context.user_data.get("admin_users_page", 1)) - 1)
     await admin_menu(update, context)
 
 @restricted_callback
@@ -784,7 +722,6 @@ async def callback_admin_user_view(update: Update, context: ContextTypes.DEFAULT
     keyboard.append([InlineKeyboardButton("↩️ Volver", callback_data="admin_menu")])
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# Confirmaciones admin: eliminar usuario completo
 @restricted_callback
 async def callback_admin_delete_user_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -818,7 +755,6 @@ async def callback_admin_delete_user(update: Update, context: ContextTypes.DEFAU
     if user_id_str in data:
         data.pop(user_id_str)
         save_data_with_retry(data)
-        # también quitar de authorized users si existe
         try:
             auth = load_authorized_users()
             uid_int = int(user_id_str)
@@ -837,9 +773,9 @@ async def callback_admin_cancel_delete(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     context.user_data.pop("admin_confirm_delete_user", None)
+    context.user_data.pop("admin_confirm_delete_account", None)
     await query.edit_message_text("Eliminación cancelada.", parse_mode="Markdown")
 
-# Confirmaciones admin: eliminar cuenta específica
 @restricted_callback
 async def callback_admin_delete_account_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -881,8 +817,7 @@ async def callback_admin_delete_account(update: Update, context: ContextTypes.DE
             return
     await query.edit_message_text("Cuenta o usuario no encontrado.", parse_mode="Markdown")
 
-# ------------------ BROADCAST (MENSAJE GLOBAL) ------------------
-
+# ------------------ BROADCAST ------------------
 @restricted_callback
 async def callback_admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -894,28 +829,24 @@ async def callback_admin_broadcast_start(update: Update, context: ContextTypes.D
     context.user_data["awaiting_broadcast"] = True
     await query.edit_message_text("Envía el mensaje que quieres enviar a todos los usuarios registrados. Usa texto simple.")
 
-@restricted
-async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_broadcast_message_internal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        return
+        return True
     if not context.user_data.pop("awaiting_broadcast", False):
-        return
+        return False
     text = update.message.text
     data = load_data()
     sent = 0
     failed = 0
-    # Enviar a todos los usuarios que aparecen en data (keys)
     for user_id_str in list(data.keys()):
         try:
             await context.bot.send_message(chat_id=int(user_id_str), text=text)
             sent += 1
-            # pequeña pausa para evitar límites
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
             continue
-    # También enviar a usuarios autorizados que no estén en data
     try:
         auth = load_authorized_users()
         for uid in auth:
@@ -929,15 +860,14 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
     except Exception:
         pass
     await update.message.reply_text(f"Mensaje enviado. Éxitos: {sent}. Fallos: {failed}.")
+    return True
 
 # ===================== HANDLERS ADICIONALES =====================
-# Handler para mostrar informe público
 @restricted
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = generate_public_report()
     await update.message.reply_text(report, parse_mode="Markdown")
 
-# Handler admin quick command to show admin report
 @restricted
 async def cmd_admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -947,7 +877,6 @@ async def cmd_admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = generate_admin_report()
     await update.message.reply_text(report, parse_mode="Markdown")
 
-# Comando para añadir usuario autorizado (solo admin)
 @restricted
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -970,6 +899,37 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_authorized_users(auth)
     await update.message.reply_text(f"Usuario {uid} autorizado.")
 
+# ------------------ NAVEGACIÓN: volver al menú principal ------------------
+@restricted_callback
+async def callback_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # Limpiar páginas temporales
+    context.user_data.pop("accounts_page", None)
+    context.user_data.pop("admin_users_page", None)
+    # Mostrar menú principal privado
+    # Reutilizamos handle_private_start: simulamos llamada con el mismo update
+    # Si el callback proviene de admin menu, editamos; si no, enviamos nuevo mensaje
+    try:
+        await handle_private_start(update, context)
+    except Exception:
+        # Fallback: editar mensaje con texto simple
+        await query.edit_message_text("Volviendo al menú principal...")
+
+# ===================== UNIFICACIÓN DE MESSAGE HANDLER =====================
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Priorizar broadcast
+    processed = await handle_broadcast_message_internal(update, context)
+    if processed:
+        return
+    # Luego edición estructurada
+    processed_edit = await handle_structured_edit_values(update, context)
+    if processed_edit:
+        return
+    # Si no fue procesado por ninguno, ignorar o responder con ayuda
+    # (evitamos capturar mensajes que no correspondan a flujos activos)
+    return
+
 # ===================== REGISTRO DE HANDLERS Y ARRANQUE =====================
 def main():
     application = Application.builder().token(TOKEN).build()
@@ -984,12 +944,13 @@ def main():
     application.add_handler(CommandHandler("editaccounts", send_accounts_list_for_edit))
     application.add_handler(CommandHandler("admin", admin_menu))
 
-    # Callbacks para navegación y acciones
+    # Callbacks: cuentas (paginación, editar, eliminar)
     application.add_handler(CallbackQueryHandler(callback_accounts_pagination, pattern=r"^accounts_(next|prev)$"))
     application.add_handler(CallbackQueryHandler(callback_edit_account_start, pattern=r"^edit_account:"))
     application.add_handler(CallbackQueryHandler(callback_delete_own_account, pattern=r"^delete_account:"))
     application.add_handler(CallbackQueryHandler(callback_confirm_delete_account, pattern=r"^confirm_delete_account:"))
     application.add_handler(CallbackQueryHandler(callback_cancel_delete_account, pattern=r"^cancel_delete_account$"))
+    application.add_handler(CallbackQueryHandler(callback_menu_back, pattern=r"^menu_back$"))
 
     # Admin callbacks
     application.add_handler(CallbackQueryHandler(admin_menu, pattern=r"^admin_menu$"))
@@ -1002,14 +963,11 @@ def main():
     application.add_handler(CallbackQueryHandler(callback_admin_delete_account, pattern=r"^admin_delete_account:"))
     application.add_handler(CallbackQueryHandler(callback_admin_broadcast_start, pattern=r"^admin_broadcast$"))
 
-    # Callbacks for pagination and menu back
+    # Callbacks para navegación específica (admin volver)
     application.add_handler(CallbackQueryHandler(admin_menu, pattern=r"^admin_menu$"))
-    application.add_handler(CallbackQueryHandler(lambda u, c: c.user_data.pop("accounts_page", None) or u.callback_query.edit_message_text("Volviendo..."), pattern=r"^menu_back$"))
 
-    # Handlers para edición estructurada y broadcast (mensajes de texto)
-    # IMPORTANTE: estos MessageHandlers deben ir después de handlers más específicos
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_structured_edit_values))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_message))
+    # Un único MessageHandler que enruta según estado
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
 
     # Set bot commands (opcional)
     try:
@@ -1027,11 +985,9 @@ def main():
 
     # Ejecutar webhook si está configurado
     if WEBHOOK_URL:
-        # run_webhook requiere host y port; Render suele usar 0.0.0.0 y el puerto de env
         logger.info("Iniciando webhook en %s:%s", "0.0.0.0", PORT)
         application.run_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN, webhook_url=f"{WEBHOOK_URL}")
     else:
-        # Fallback a polling (útil para pruebas locales)
         logger.info("WEBHOOK_URL no configurado, arrancando en polling (solo para pruebas).")
         application.run_polling()
 
