@@ -15,7 +15,7 @@ Variables de entorno necesarias:
 - GITHUB_AUTH_PATH (opcional, por defecto data/authorized_users.json)
 - Manejo seguro de CallbackQuery
 - Mejoras en llamadas a GitHub (timeout, headers)
-- Comando admin: /deleteuserdata <user_id>
+- Comando admin: /deleteuserdata <usario_id>
 - Comando admin: /broadcast <mensaje>
 - Flujo de registro completo (awaiting_username, awaiting_attack, awaiting_defense)
 - Flujo de edición de cuentas (awaiting_edit_attack, awaiting_edit_defense)
