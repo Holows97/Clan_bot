@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BOT DEL CLAN - Versión final con funciones faltantes implementadas:
-- add_account (flujo estructurado: username -> attack -> defense -> confirmar)
-- my_accounts (mostrar cuentas del usuario)
-- clan_report (mostrar informe público desde callback)
-- my_ranking (calcular y mostrar ranking del usuario)
-- send_id_request (callback para usuarios no autorizados)
-- group_report y group_admin (callbacks para botones en grupos)
-- navegación "volver" corregida y consistente
-Persistencia en GitHub como en versiones previas.
+BOT DEL CLAN - Archivo único corregido y completo (bot.py)
+
+Incluye:
+- Persistencia en GitHub (load/save)
+- Menús privados y de grupo
+- Paginación para cuentas y usuarios admin
+- Flujo estructurado de añadir cuenta (username -> attack -> defense) con confirmación de sobrescritura
+- Flujo estructurado de edición (attack -> defense)
+- Confirmaciones para eliminación (usuario y cuentas)
+- Broadcast por lotes con pausas
+- Helpers safe_edit / safe_send para evitar errores de Markdown/longitud
+- Limpieza de context.user_data y logging mejorado
 """
 import os
 import json
@@ -36,6 +39,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.helpers import escape_markdown
 
 # ================= CONFIGURACIÓN (desde env) =================
 TOKEN = os.environ.get("TOKEN")
@@ -157,6 +161,39 @@ def save_data_with_retry(data, retries=3, delay=0.5):
     logger.error("No se pudo guardar datos en GitHub tras %s intentos", retries)
     return False
 
+# ----------------- HELPERS DE MENSAJERÍA Y UTILIDADES -----------------
+def _safe_text(text: str, max_len: int = 3900) -> str:
+    """Escapa Markdown y recorta texto demasiado largo para evitar errores en edit_message_text."""
+    if not text:
+        return ""
+    try:
+        esc = escape_markdown(text, version=2)
+    except Exception:
+        esc = text.replace("*", "\\*").replace("_", "\\_").replace("`", "\\`").replace("[", "\\[")
+    if len(esc) > max_len:
+        return esc[: max_len - 100] + "\n\n... (mensaje recortado)"
+    return esc
+
+async def safe_edit(query, text: str, reply_markup=None, parse_mode="Markdown"):
+    """Editar mensaje con escape y manejo de errores."""
+    try:
+        safe = _safe_text(text)
+        await query.edit_message_text(safe, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        logger.warning("safe_edit falló: %s. Intentando enviar nuevo mensaje.", e)
+        try:
+            await query.message.reply_text(_safe_text(text), reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as e2:
+            logger.exception("No se pudo enviar mensaje alternativo: %s", e2)
+
+async def safe_send(bot, chat_id: int, text: str, reply_markup=None, parse_mode="Markdown"):
+    """Enviar mensaje con escape y manejo de errores."""
+    try:
+        safe = _safe_text(text)
+        await bot.send_message(chat_id=chat_id, text=safe, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        logger.exception("safe_send falló al enviar a %s: %s", chat_id, e)
+
 # ================= FUNCIONES DE NEGOCIO =================
 def get_user_accounts(user_id):
     data = load_data()
@@ -175,11 +212,15 @@ def add_user_account(user_id, account_data):
         if account["username"].lower() == account_data["username"].lower():
             accounts[i] = account_data
             data[user_id_str]["accounts"] = accounts
-            save_data_with_retry(data)
+            ok = save_data_with_retry(data)
+            if not ok:
+                logger.error("add_user_account: fallo al guardar actualización de cuenta %s para user %s", account_data["username"], user_id)
             return "updated"
     accounts.append(account_data)
     data[user_id_str]["accounts"] = accounts
-    save_data_with_retry(data)
+    ok = save_data_with_retry(data)
+    if not ok:
+        logger.error("add_user_account: fallo al guardar nueva cuenta %s para user %s", account_data["username"], user_id)
     return "added"
 
 def delete_user_account(user_id, username):
@@ -190,7 +231,9 @@ def delete_user_account(user_id, username):
         new_accounts = [acc for acc in accounts if acc["username"].lower() != username.lower()]
         if len(new_accounts) < len(accounts):
             data[user_id_str]["accounts"] = new_accounts
-            save_data_with_retry(data)
+            ok = save_data_with_retry(data)
+            if not ok:
+                logger.error("delete_user_account: fallo al guardar eliminación de %s para user %s", username, user_id)
             return True
     return False
 
@@ -480,27 +523,43 @@ async def handle_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def callback_add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # iniciar flujo
     context.user_data["add_step"] = "username"
     context.user_data.pop("add_temp", None)
-    await query.edit_message_text(
-        "Registro de nueva cuenta.\n\nEnvía el *nombre de usuario* de la cuenta (ej: Player123).",
-        parse_mode="Markdown"
-    )
+    await safe_edit(query, "Registro de nueva cuenta.\n\nEnvía el *nombre de usuario* de la cuenta (ej: Player123).", parse_mode="Markdown")
 
 @restricted
 async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Este handler procesa el flujo de alta si add_step está presente
     if "add_step" not in context.user_data:
         return False
     step = context.user_data.get("add_step")
     text = update.message.text.strip()
     if step == "username":
-        # guardar username temporal y pedir ataque
+        existing = False
+        try:
+            accounts = get_user_accounts(update.effective_user.id)
+            for acc in accounts:
+                if acc.get("username", "").lower() == text.lower():
+                    existing = True
+                    break
+        except Exception:
+            existing = False
         context.user_data.setdefault("add_temp", {})["username"] = text
-        context.user_data["add_step"] = "attack"
-        await update.message.reply_text("Nombre guardado. Ahora envía el valor de *ataque* (número).", parse_mode="Markdown")
-        return True
+        if existing:
+            context.user_data["add_step"] = "confirm_overwrite"
+            keyboard = [
+                [InlineKeyboardButton("✅ Sí, actualizar cuenta", callback_data=f"add_confirm_overwrite:{text}")],
+                [InlineKeyboardButton("❌ Cancelar", callback_data="add_cancel_overwrite")]
+            ]
+            await update.message.reply_text(
+                f"La cuenta **{text}** ya existe. ¿Deseas actualizar sus valores?",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return True
+        else:
+            context.user_data["add_step"] = "attack"
+            await update.message.reply_text("Nombre guardado. Ahora envía el valor de *ataque* (número).", parse_mode="Markdown")
+            return True
     elif step == "attack":
         try:
             attack = int(text.replace(",", ""))
@@ -521,11 +580,9 @@ async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT
         username = temp.get("username")
         attack = temp.get("attack")
         if not username or attack is None:
-            # estado perdido
             context.user_data.pop("add_step", None)
             await update.message.reply_text("Estado perdido. Inicia de nuevo con /editaccounts o el botón Añadir cuenta.")
             return True
-        # confirmar y guardar
         account_data = {
             "username": username,
             "attack": attack,
@@ -537,6 +594,27 @@ async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT
         return True
     return False
 
+# Callbacks para confirmación de sobrescritura en add_account
+@restricted_callback
+async def callback_add_confirm_overwrite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, username = query.data.split(":", 1)
+    except Exception:
+        await safe_edit(query, "Dato inválido.")
+        return
+    context.user_data["add_step"] = "attack"
+    await safe_edit(query, f"Actualizarás la cuenta **{username}**. Ahora envía el valor de *ataque* (número).", parse_mode="Markdown")
+
+@restricted_callback
+async def callback_add_cancel_overwrite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("add_step", None)
+    context.user_data.pop("add_temp", None)
+    await safe_edit(query, "Registro cancelado. Si quieres, inicia de nuevo con el botón Añadir cuenta.")
+
 # my_accounts: mostrar cuentas del usuario (resumen) con botones para editar/eliminar
 @restricted_callback
 async def callback_my_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -545,7 +623,7 @@ async def callback_my_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
     user = query.from_user
     accounts = get_user_accounts(user.id)
     if not accounts:
-        await query.edit_message_text("No tienes cuentas registradas.")
+        await safe_edit(query, "No tienes cuentas registradas.")
         return
     text = f"📂 **Tus cuentas ({len(accounts)}):**\n\n"
     for acc in accounts:
@@ -555,7 +633,7 @@ async def callback_my_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard.append([InlineKeyboardButton(f"✏️ Editar {acc['username']}", callback_data=f"edit_account:{acc['username']}"),
                          InlineKeyboardButton(f"🗑️ Eliminar {acc['username']}", callback_data=f"delete_account:{acc['username']}")])
     keyboard.append([InlineKeyboardButton("↩️ Volver", callback_data="menu_back")])
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 # clan_report: mostrar informe público desde callback
 @restricted_callback
@@ -563,8 +641,7 @@ async def callback_clan_report(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     report = generate_public_report()
-    # editar mensaje si proviene de callback
-    await query.edit_message_text(report, parse_mode="Markdown")
+    await safe_edit(query, report, parse_mode="Markdown")
 
 # my_ranking: calcular y mostrar la posición del usuario entre todas las cuentas
 @restricted_callback
@@ -582,24 +659,21 @@ async def callback_my_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "owner": user_id_str
             })
     if not all_accounts:
-        await query.edit_message_text("No hay cuentas registradas.")
+        await safe_edit(query, "No hay cuentas registradas.")
         return
-    # ordenar por ataque
     all_accounts.sort(key=lambda x: x["attack"], reverse=True)
-    # construir ranking y buscar las cuentas del usuario
     user_accounts = [acc for acc in all_accounts if acc["owner"] == str(user.id)]
     if not user_accounts:
-        await query.edit_message_text("No tienes cuentas registradas.")
+        await safe_edit(query, "No tienes cuentas registradas.")
         return
     text = "🏅 **Tu ranking**\n\n"
     for i, acc in enumerate(all_accounts, 1):
         if acc["owner"] == str(user.id):
             text += f"{i}. **{acc['username']}** - ⚔️ {acc['attack']:,}\n"
-    # añadir top 5 para contexto
     text += "\n🔝 Top 5:\n"
     for i, acc in enumerate(all_accounts[:5], 1):
         text += f"{i}. {acc['username']} - ⚔️ {acc['attack']:,}\n"
-    await query.edit_message_text(text, parse_mode="Markdown")
+    await safe_edit(query, text, parse_mode="Markdown")
 
 # send_id_request: callback para usuarios no autorizados que envía la solicitud al admin
 @restricted_callback
@@ -643,23 +717,20 @@ async def callback_send_id_request(update: Update, context: ContextTypes.DEFAULT
         except Exception as e:
             logger.warning("No se pudo enviar la solicitud al admin por username: %s", e)
     if sent_to_admin:
-        await query.edit_message_text("Tu ID ha sido enviado al administrador. Espera la autorización.")
+        await safe_edit(query, "Tu ID ha sido enviado al administrador. Espera la autorización.")
     else:
-        await query.edit_message_text("No pude notificar al administrador automáticamente. Envía tu ID manualmente.")
+        await safe_edit(query, "No pude notificar al administrador automáticamente. Envía tu ID manualmente.")
 
-# group_report: mostrar informe público en grupo (editar o enviar)
+# group_report: mostrar informe público en grupo (enviar nuevo mensaje)
 @restricted_callback
 async def callback_group_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     report = generate_public_report()
-    # En grupos preferimos enviar un nuevo mensaje para no editar mensajes de otros
     try:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=report, parse_mode="Markdown")
-        await query.answer()  # ya respondido
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=_safe_text(report), parse_mode="Markdown")
     except Exception:
-        # fallback: editar si no se puede enviar
-        await query.edit_message_text(report, parse_mode="Markdown")
+        await safe_edit(query, report, parse_mode="Markdown")
 
 # group_admin: mostrar opciones admin en grupo (si es admin)
 @restricted_callback
@@ -668,35 +739,31 @@ async def callback_group_admin(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     user = query.from_user
     if not is_admin(user.id):
-        await query.edit_message_text("Acceso denegado.")
+        await safe_edit(query, "Acceso denegado.")
         return
     keyboard = [
         [InlineKeyboardButton("📣 Enviar mensaje global", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🧾 Ver informe admin", callback_data="admin_menu")]
     ]
-    await query.edit_message_text("Menú admin (grupo):", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit(query, "Menú admin (grupo):", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ===================== NAVEGACIÓN: volver al menú principal =====================
 @restricted_callback
 async def callback_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # limpiar páginas temporales
     context.user_data.pop("accounts_page", None)
     context.user_data.pop("admin_users_page", None)
-    # Mostrar menú principal privado (editar si es callback en privado)
-    # Reutilizamos handle_private_start que detecta update.callback_query y edita
-    await handle_private_start(update, context)
+    try:
+        await handle_private_start(update, context)
+    except Exception as e:
+        logger.exception("callback_menu_back: error al volver al menú principal: %s", e)
+        try:
+            await safe_edit(query, "Volviendo al menú principal...")
+        except Exception:
+            pass
 
-# ===================== EDICIÓN / BORRADO / BROADCAST (ya implementados) =====================
-# (Se reutilizan las funciones ya presentes en versiones previas: edición estructurada,
-# confirmaciones de borrado, admin_menu, broadcast, etc.)
-# Para mantener el archivo coherente, incluimos las funciones necesarias que ya estaban
-# en la versión anterior y que el bot usa: paginación, edición estructurada, confirmaciones.
-
-# --- Reutilizamos/definimos aquí las funciones que ya existían en versiones previas ---
-# Para evitar duplicados, definimos versiones mínimas que integran con los nuevos handlers.
-
+# ===================== EDICIÓN / BORRADO / BROADCAST =====================
 @restricted_callback
 async def callback_edit_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -704,11 +771,11 @@ async def callback_edit_account_start(update: Update, context: ContextTypes.DEFA
     try:
         _, username = query.data.split(":", 1)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     context.user_data["editing_account"] = username
     context.user_data["edit_step"] = "attack"
-    await query.edit_message_text(
+    await safe_edit(query,
         f"Has elegido editar **{username}**.\n\n"
         "Primero, envía el nuevo valor de **ataque** (solo el número).\n"
         "Ejemplo: `12345`",
@@ -722,17 +789,17 @@ async def callback_delete_own_account(update: Update, context: ContextTypes.DEFA
     try:
         _, username = query.data.split(":", 1)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     context.user_data["confirm_delete_account"] = username
     keyboard = [
         [InlineKeyboardButton("✅ Sí, eliminar", callback_data=f"confirm_delete_account:{username}")],
         [InlineKeyboardButton("❌ Cancelar", callback_data="cancel_delete_account")]
     ]
-    await query.edit_message_text(
+    await safe_edit(query,
         f"¿Seguro que quieres eliminar la cuenta **{username}**? Esta acción no se puede deshacer.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
     )
 
 @restricted_callback
@@ -742,24 +809,24 @@ async def callback_confirm_delete_account(update: Update, context: ContextTypes.
     try:
         _, username = query.data.split(":", 1)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     user = query.from_user
     success = delete_user_account(user.id, username)
     context.user_data.pop("confirm_delete_account", None)
     if success:
-        await query.edit_message_text(f"Cuenta **{username}** eliminada correctamente.", parse_mode="Markdown")
+        await safe_edit(query, f"Cuenta **{username}** eliminada correctamente.", parse_mode="Markdown")
     else:
-        await query.edit_message_text("No pude eliminar la cuenta (no encontrada).", parse_mode="Markdown")
+        await safe_edit(query, "No pude eliminar la cuenta (no encontrada).", parse_mode="Markdown")
 
 @restricted_callback
 async def callback_cancel_delete_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.pop("confirm_delete_account", None)
-    await query.edit_message_text("Eliminación cancelada.", parse_mode="Markdown")
+    await safe_edit(query, "Eliminación cancelada.", parse_mode="Markdown")
 
-# Admin menu, pagination and delete handlers (kept minimal and consistent)
+# ------------------ MENÚ ADMIN ------------------
 @restricted
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -815,12 +882,12 @@ async def callback_admin_user_view(update: Update, context: ContextTypes.DEFAULT
     try:
         _, user_id_str = query.data.split(":", 1)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     data = load_data()
     user_data = data.get(user_id_str)
     if not user_data:
-        await query.edit_message_text("Usuario no encontrado.")
+        await safe_edit(query, "Usuario no encontrado.")
         return
     text = f"Usuario: **{user_data.get('telegram_name','-')}** (ID: `{user_id_str}`)\n\nCuentas:\n"
     for acc in user_data.get("accounts", []):
@@ -831,7 +898,7 @@ async def callback_admin_user_view(update: Update, context: ContextTypes.DEFAULT
     for acc in user_data.get("accounts", []):
         keyboard.append([InlineKeyboardButton(f"🗑️ Eliminar {acc['username']}", callback_data=f"admin_delete_account_confirm:{user_id_str}:{acc['username']}")])
     keyboard.append([InlineKeyboardButton("↩️ Volver", callback_data="admin_menu")])
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit(query, text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 @restricted_callback
 async def callback_admin_delete_user_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -840,14 +907,14 @@ async def callback_admin_delete_user_confirm(update: Update, context: ContextTyp
     try:
         _, user_id_str = query.data.split(":", 1)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     context.user_data["admin_confirm_delete_user"] = user_id_str
     keyboard = [
         [InlineKeyboardButton("✅ Sí, eliminar usuario", callback_data=f"admin_delete_user:{user_id_str}")],
         [InlineKeyboardButton("❌ Cancelar", callback_data="admin_cancel_delete")]
     ]
-    await query.edit_message_text(
+    await safe_edit(query,
         f"¿Seguro que quieres eliminar al usuario `{user_id_str}` y todas sus cuentas? Esta acción es irreversible.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -860,7 +927,7 @@ async def callback_admin_delete_user(update: Update, context: ContextTypes.DEFAU
     try:
         _, user_id_str = query.data.split(":", 1)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     data = load_data()
     if user_id_str in data:
@@ -875,9 +942,9 @@ async def callback_admin_delete_user(update: Update, context: ContextTypes.DEFAU
         except Exception:
             pass
         context.user_data.pop("admin_confirm_delete_user", None)
-        await query.edit_message_text(f"Usuario `{user_id_str}` eliminado correctamente.", parse_mode="Markdown")
+        await safe_edit(query, f"Usuario `{user_id_str}` eliminado correctamente.", parse_mode="Markdown")
     else:
-        await query.edit_message_text("Usuario no encontrado.", parse_mode="Markdown")
+        await safe_edit(query, "Usuario no encontrado.", parse_mode="Markdown")
 
 @restricted_callback
 async def callback_admin_cancel_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -885,7 +952,7 @@ async def callback_admin_cancel_delete(update: Update, context: ContextTypes.DEF
     await query.answer()
     context.user_data.pop("admin_confirm_delete_user", None)
     context.user_data.pop("admin_confirm_delete_account", None)
-    await query.edit_message_text("Eliminación cancelada.", parse_mode="Markdown")
+    await safe_edit(query, "Eliminación cancelada.", parse_mode="Markdown")
 
 @restricted_callback
 async def callback_admin_delete_account_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -894,14 +961,14 @@ async def callback_admin_delete_account_confirm(update: Update, context: Context
     try:
         _, user_id_str, username = query.data.split(":", 2)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     context.user_data["admin_confirm_delete_account"] = (user_id_str, username)
     keyboard = [
         [InlineKeyboardButton("✅ Sí, eliminar cuenta", callback_data=f"admin_delete_account:{user_id_str}:{username}")],
         [InlineKeyboardButton("❌ Cancelar", callback_data="admin_cancel_delete")]
     ]
-    await query.edit_message_text(
+    await safe_edit(query,
         f"¿Seguro que quieres eliminar la cuenta **{username}** del usuario `{user_id_str}`?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -914,7 +981,7 @@ async def callback_admin_delete_account(update: Update, context: ContextTypes.DE
     try:
         _, user_id_str, username = query.data.split(":", 2)
     except Exception:
-        await query.edit_message_text("Dato inválido.")
+        await safe_edit(query, "Dato inválido.")
         return
     data = load_data()
     if user_id_str in data:
@@ -924,9 +991,9 @@ async def callback_admin_delete_account(update: Update, context: ContextTypes.DE
             data[user_id_str]["accounts"] = new_accounts
             save_data_with_retry(data)
             context.user_data.pop("admin_confirm_delete_account", None)
-            await query.edit_message_text(f"Cuenta **{username}** eliminada del usuario `{user_id_str}`.", parse_mode="Markdown")
+            await safe_edit(query, f"Cuenta **{username}** eliminada del usuario `{user_id_str}`.", parse_mode="Markdown")
             return
-    await query.edit_message_text("Cuenta o usuario no encontrado.", parse_mode="Markdown")
+    await safe_edit(query, "Cuenta o usuario no encontrado.", parse_mode="Markdown")
 
 # Broadcast start (admin)
 @restricted_callback
@@ -938,7 +1005,7 @@ async def callback_admin_broadcast_start(update: Update, context: ContextTypes.D
         await query.answer("No autorizado", show_alert=True)
         return
     context.user_data["awaiting_broadcast"] = True
-    await query.edit_message_text("Envía el mensaje que quieres enviar a todos los usuarios registrados. Usa texto simple.")
+    await safe_edit(query, "Envía el mensaje que quieres enviar a todos los usuarios registrados. Usa texto simple.")
 
 async def handle_broadcast_message_internal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -950,20 +1017,23 @@ async def handle_broadcast_message_internal(update: Update, context: ContextType
     data = load_data()
     sent = 0
     failed = 0
-    for user_id_str in list(data.keys()):
-        try:
-            await context.bot.send_message(chat_id=int(user_id_str), text=text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-            continue
+    batch_size = 20
+    user_ids = [int(uid) for uid in list(data.keys())]
+    for i in range(0, len(user_ids), batch_size):
+        batch = user_ids[i : i + batch_size]
+        for uid in batch:
+            try:
+                await context.bot.send_message(chat_id=uid, text=_safe_text(text))
+                sent += 1
+            except Exception:
+                failed += 1
+        await asyncio.sleep(0.5)
     try:
         auth = load_authorized_users()
         for uid in auth:
             if str(uid) not in data:
                 try:
-                    await context.bot.send_message(chat_id=uid, text=text)
+                    await context.bot.send_message(chat_id=uid, text=_safe_text(text))
                     sent += 1
                     await asyncio.sleep(0.05)
                 except Exception:
@@ -975,18 +1045,13 @@ async def handle_broadcast_message_internal(update: Update, context: ContextType
 
 # ===================== UNIFICACIÓN DE MESSAGE HANDLER =====================
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Priorizar broadcast
     processed = await handle_broadcast_message_internal(update, context)
     if processed:
         return
-    # Luego flujo de alta de cuenta
     processed_add = await handle_add_account_steps(update, context)
     if processed_add:
         return
-    # Luego edición estructurada (si existe)
     if "editing_account" in context.user_data and "edit_step" in context.user_data:
-        # Reuse the same logic as earlier: accept attack then defense
-        # We'll implement minimal inline handling here
         step = context.user_data.get("edit_step")
         text = update.message.text.strip()
         try:
@@ -1025,7 +1090,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                     return
             await update.message.reply_text("No encontré la cuenta para actualizar.")
             return
-    # Si no procesado, ignorar
     return
 
 # ===================== HANDLERS ADICIONALES =====================
@@ -1076,11 +1140,13 @@ def main():
     application.add_handler(CommandHandler("report", cmd_report))
     application.add_handler(CommandHandler("adminreport", cmd_admin_report))
     application.add_handler(CommandHandler("adduser", cmd_adduser))
-    application.add_handler(CommandHandler("editaccounts", send_accounts_list_for_edit))
+    application.add_handler(CommandHandler("editaccounts", callback_my_accounts))
     application.add_handler(CommandHandler("admin", admin_menu))
 
     # Callbacks: add account, my_accounts, clan_report, my_ranking, send_id_request, group
     application.add_handler(CallbackQueryHandler(callback_add_account_start, pattern=r"^add_account$"))
+    application.add_handler(CallbackQueryHandler(callback_add_confirm_overwrite, pattern=r"^add_confirm_overwrite:"))
+    application.add_handler(CallbackQueryHandler(callback_add_cancel_overwrite, pattern=r"^add_cancel_overwrite$"))
     application.add_handler(CallbackQueryHandler(callback_my_accounts, pattern=r"^my_accounts$"))
     application.add_handler(CallbackQueryHandler(callback_clan_report, pattern=r"^clan_report$"))
     application.add_handler(CallbackQueryHandler(callback_my_ranking, pattern=r"^my_ranking$"))
