@@ -36,7 +36,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import BadRequest, RetryAfter, Unauthorized, TelegramError
+from telegram.error import BadRequest, RetryAfter, Forbidden, TelegramError
 
 # ================= CONFIGURACIÓN (desde env) =================
 TOKEN = os.environ.get("TOKEN")
@@ -72,8 +72,6 @@ def fix_mojibake(s: str) -> str:
     if not isinstance(s, str):
         return s
     try:
-        # Detect common symptom: presence of replacement characters or odd sequences
-        # Re-encode as latin-1 bytes and decode as utf-8
         return s.encode("latin-1").decode("utf-8")
     except Exception:
         return s
@@ -117,7 +115,6 @@ def _get_file_from_github(path: str):
             try:
                 content = raw.decode("utf-8")
             except UnicodeDecodeError:
-                # Fallback: try latin-1 then convert to utf-8
                 try:
                     content = raw.decode("latin-1")
                     content = content.encode("latin-1").decode("utf-8", errors="replace")
@@ -229,7 +226,6 @@ def get_user_accounts(user_id: int):
 
 def add_user_account(user_id: int, account_data: dict):
     """Añadir o actualizar cuenta de usuario en el JSON almacenado en GitHub."""
-    # Validar y normalizar account_data mínimamente
     username = account_data.get("username")
     if not username or not isinstance(username, str):
         raise ValueError("username inválido")
@@ -324,7 +320,6 @@ def generate_public_report():
     for user_data in data.values():
         accounts = user_data.get("accounts", [])
         for acc in accounts:
-            # defensiva: asegurar claves
             username = acc.get("username", "N/A")
             attack = int(acc.get("attack", 0))
             defense = int(acc.get("defense", 0))
@@ -403,8 +398,8 @@ async def safe_answer_callback(query, text: Optional[str] = None, show_alert: bo
         logger.warning("RetryAfter al responder callback: %s", e)
     except BadRequest as e:
         logger.warning("BadRequest al responder callback: %s", e)
-    except Unauthorized as e:
-        logger.error("Unauthorized al responder callback: %s", e)
+    except Forbidden as e:
+        logger.error("Forbidden al responder callback (posible bloqueo o falta de permisos): %s", e)
     except TelegramError as e:
         logger.exception("Error de Telegram al responder callback: %s", e)
     except Exception as e:
@@ -418,6 +413,8 @@ async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=None
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest as e:
         logger.warning("No se pudo editar mensaje (BadRequest): %s", e)
+    except Forbidden as e:
+        logger.warning("No se pudo editar mensaje (Forbidden): %s", e)
     except Exception as e:
         logger.exception("Error editando mensaje: %s", e)
 
