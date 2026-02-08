@@ -13,14 +13,6 @@
   },
   "7470037078": {
     "telegram_name": "Neit",
-    "accounts": [
-      {
-        "username": "Neit",
-        "attack": 1026443,
-        "defense": 1026443,
-        "telegram_name": "Neit",
-        "added_date": "2026-02-07T22:59:22.975146"
-      }
-    ]
+    "accounts": []
   }
 }
