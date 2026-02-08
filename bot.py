@@ -160,6 +160,28 @@ def save_data_with_retry(data, retries=3, delay=0.5):
             return False
     logger.error("No se pudo guardar datos en GitHub tras %s intentos", retries)
     return False
+    
+    #==============Autorización=========
+def add_authorized_user(user_id: int):
+    try:
+        # Ejemplo: archivo JSON con lista de autorizados
+        import json
+        from pathlib import Path
+        AUTH_FILE = Path("authorized_users.json")
+        if AUTH_FILE.exists():
+            data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+        else:
+            data = []
+        if user_id not in data:
+            data.append(user_id)
+            AUTH_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.exception("Error guardando usuario autorizado: %s", e)
+
+def is_admin(user_id: int) -> bool:
+    """Comprueba si user_id es el admin configurado."""
+    return bool(ADMIN_USER_ID and user_id == ADMIN_USER_ID)
+ 
 
 # ----------------- HELPERS DE MENSAJERÍA Y UTILIDADES -----------------
 def _safe_text(text: str, max_len: int = 3900) -> str:
@@ -324,6 +346,7 @@ def restricted(func):
         return await func(update, context)
     return wrapper
 
+
 def restricted_callback(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -343,10 +366,12 @@ def is_admin(user_id):
     return user_id == ADMIN_USER_ID
 
 # ================= COMANDOS PÚBLICOS =================
+#===SOLICITUD DE ID
 async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     admin_username = ADMIN_USERNAME
     admin_id = ADMIN_USER_ID if ADMIN_USER_ID != 0 else None
+
     user_text = (
         f"👤 **Tu ID de Telegram:**\n"
         f"`{user.id}`\n\n"
@@ -355,45 +380,91 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📬 He enviado tu ID al administrador para que te autorice. "
         "Por favor, espera la confirmación."
     )
+
+@restricted_callback
+async def callback_admin_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Maneja callbacks: admin_request:accept:<id> y admin_request:deny:<id>.
+    Si el admin acepta, autoriza al usuario y lo notifica.
+    Si deniega, notifica al usuario.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = (query.data or "")
+    parts = data.split(":")
+    if len(parts) != 3:
+        await safe_edit(query, "Dato inválido.")
+        return
+
+    action = parts[1]
+    target_id = parts[2]
+
+    # Validar que quien pulsa es el admin
+    caller_id = query.from_user.id
+    if not is_admin(caller_id):
+        await query.answer("No tienes permisos para realizar esta acción.", show_alert=True)
+        return
+
+    try:
+        target_int = int(target_id)
+    except ValueError:
+        await safe_edit(query, "ID inválido.")
+        return
+
+    if action == "accept":
+        # Autorizar
+        try:
+            add_authorized_user(target_int)
+            # Notificar al solicitante
+            try:
+                await context.bot.send_message(
+                    chat_id=target_int,
+                    text="✅ Tu solicitud ha sido *aceptada*. Ya puedes usar el bot.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                logger.warning("No se pudo notificar al usuario %s tras aceptar", target_id)
+            await safe_edit(query, f"Usuario `{target_id}` autorizado.", parse_mode="Markdown")
+        except Exception as e:
+            logger.exception("Error al autorizar usuario %s: %s", target_id, e)
+            await safe_edit(query, "Error al autorizar al usuario.")
+        return
+
+    if action == "deny":
+        # Denegar y notificar
+        try:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_int,
+                    text="❌ Tu solicitud ha sido *denegada*. Contacta al admin para más información.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                logger.warning("No se pudo notificar al usuario %s tras denegar", target_id)
+            await safe_edit(query, f"Solicitud de `{target_id}` denegada.", parse_mode="Markdown")
+        except Exception as e:
+            logger.exception("Error al denegar solicitud %s: %s", target_id, e)
+            await safe_edit(query, "Error al procesar la denegación.")
+        return
+
+    # Si llega aquí, acción desconocida
+    await safe_edit(query, "Acción no reconocida.")
+
+    # Intentar notificar al admin usando la nueva función (envía botones Aceptar/Denegar)
     sent_to_admin = False
+    try:
+        sent_to_admin = await notify_admin_request(context.bot, user)
+    except Exception as e:
+        logger.warning("Error al notificar al admin con notify_admin_request: %s", e)
+        sent_to_admin = False
+
+    # Construir botón de contacto si hay admin configurado (comportamiento previo)
     admin_contact_url = None
     if admin_username:
-        admin_username = admin_username.lstrip("@")
-        admin_contact_url = f"https://t.me/{admin_username}"
+        admin_contact_url = f"https://t.me/{admin_username.lstrip('@')}"
     elif admin_id:
         admin_contact_url = f"tg://user?id={admin_id}"
-    if admin_id:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
-                    f"👤 Usuario: {user.first_name}\n"
-                    f"🆔 ID: `{user.id}`\n"
-                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
-                    f"Para autorizar usa: `/adduser {user.id}`"
-                ),
-                parse_mode="Markdown"
-            )
-            sent_to_admin = True
-        except Exception as e:
-            logger.warning("No se pudo enviar la solicitud al admin por ID: %s", e)
-    if not sent_to_admin and admin_username:
-        try:
-            await context.bot.send_message(
-                chat_id=f"@{admin_username}",
-                text=(
-                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
-                    f"👤 Usuario: {user.first_name}\n"
-                    f"🆔 ID: `{user.id}`\n"
-                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
-                    f"Para autorizar usa: `/adduser {user.id}`"
-                ),
-                parse_mode="Markdown"
-            )
-            sent_to_admin = True
-        except Exception as e:
-            logger.warning("No se pudo enviar la solicitud al admin por username: %s", e)
+
     if admin_contact_url:
         keyboard = [[InlineKeyboardButton("✉️ Contactar al admin", url=admin_contact_url)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -402,6 +473,8 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_display = str(ADMIN_USER_ID) if ADMIN_USER_ID else "No configurado"
         extra = f"\n\nID del admin: `{admin_display}`"
         await update.message.reply_text(user_text + extra, parse_mode="Markdown")
+
+    # Si no se pudo notificar automáticamente, informar al usuario (comportamiento previo)
     if not sent_to_admin:
         try:
             await update.message.reply_text(
@@ -411,6 +484,45 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+#======Notificación al Admin
+async def notify_admin_request(app_bot, user):
+    """
+    Envía al admin una notificación con botones para aceptar/denegar.
+    No guarda solicitudes en disco; el admin actúa directamente desde el mensaje.
+    """
+    text = (
+        f"➡️ **SOLICITUD DE ACCESO**\n\n"
+        f"👤 Usuario: {user.first_name}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
+        f"Acciones:"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Aceptar", callback_data=f"admin_request:accept:{user.id}"),
+            InlineKeyboardButton("❌ Denegar", callback_data=f"admin_request:deny:{user.id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    sent = False
+    # Intentar enviar por ID primero
+    if ADMIN_USER_ID:
+        try:
+            await app_bot.send_message(chat_id=ADMIN_USER_ID, text=text, parse_mode="Markdown", reply_markup=reply_markup)
+            sent = True
+        except Exception as e:
+            logger.warning("No se pudo notificar al admin por ID: %s", e)
+    # Si no se envió y hay username, intentar por username
+    if not sent and ADMIN_USERNAME:
+        try:
+            await app_bot.send_message(chat_id=f"@{ADMIN_USERNAME.lstrip('@')}", text=text, parse_mode="Markdown", reply_markup=reply_markup)
+            sent = True
+        except Exception as e:
+            logger.warning("No se pudo notificar al admin por username: %s", e)
+    return sent
+
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
@@ -525,8 +637,13 @@ async def callback_add_account_start(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     context.user_data["add_step"] = "username"
     context.user_data.pop("add_temp", None)
-    await safe_edit(query, "Registro de nueva cuenta.\n\nEnvía el *nombre de usuario* de la cuenta (ej: Player123).", parse_mode="Markdown")
-
+    keyboard = [[InlineKeyboardButton("↩️ Cancelar", callback_data="menu_back")]]
+    await safe_edit(query,
+        "Registro de nueva cuenta.\n\nEnvía el *nombre de usuario* de la cuenta (ej: Player123).",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
 @restricted
 async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "add_step" not in context.user_data:
@@ -558,7 +675,10 @@ async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT
             return True
         else:
             context.user_data["add_step"] = "attack"
-            await update.message.reply_text("Nombre guardado. Ahora envía el valor de *ataque* (número).", parse_mode="Markdown")
+            keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+            await update.message.reply_text("Nombre guardado. Ahora envía el valor de *ataque* (número).",
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup(keyboard))
             return True
     elif step == "attack":
         try:
@@ -568,7 +688,10 @@ async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT
             return True
         context.user_data.setdefault("add_temp", {})["attack"] = attack
         context.user_data["add_step"] = "defense"
-        await update.message.reply_text("Ataque guardado. Ahora envía el valor de *defensa* (número).", parse_mode="Markdown")
+        keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+        await update.message.reply_text("Ataque guardado. Ahora envía el valor de *defensa* (número).", 
+                                 parse_mode="Markdown",
+                                 reply_markup=InlineKeyboardMarkup(keyboard))
         return True
     elif step == "defense":
         try:
@@ -581,7 +704,8 @@ async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT
         attack = temp.get("attack")
         if not username or attack is None:
             context.user_data.pop("add_step", None)
-            await update.message.reply_text("Estado perdido. Inicia de nuevo con /editaccounts o el botón Añadir cuenta.")
+            keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+            await update.message.reply_text("Estado perdido. Inténtalo de nuevo")
             return True
         account_data = {
             "username": username,
@@ -590,7 +714,10 @@ async def handle_add_account_steps(update: Update, context: ContextTypes.DEFAULT
         }
         add_user_account(update.effective_user.id, account_data)
         context.user_data.pop("add_step", None)
-        await update.message.reply_text(f"Cuenta **{username}** registrada: Ataque {attack:,}, Defensa {defense:,}.", parse_mode="Markdown")
+        keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+        await update.message.reply_text(f"Cuenta **{username}** registrada: Ataque {attack:,}, Defensa {defense:,}.",
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup(keyboard))
         return True
     return False
 
@@ -641,7 +768,8 @@ async def callback_clan_report(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     report = generate_public_report()
-    await safe_edit(query, report, parse_mode="Markdown")
+    keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+    await safe_edit(query, report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 # my_ranking: calcular y mostrar la posición del usuario entre todas las cuentas
 @restricted_callback
@@ -659,12 +787,14 @@ async def callback_my_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "owner": user_id_str
             })
     if not all_accounts:
-        await safe_edit(query, "No hay cuentas registradas.")
+        keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+        await safe_edit(query, "No hay cuentas registradas.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
     all_accounts.sort(key=lambda x: x["attack"], reverse=True)
     user_accounts = [acc for acc in all_accounts if acc["owner"] == str(user.id)]
     if not user_accounts:
-        await safe_edit(query, "No tienes cuentas registradas.")
+        keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+        await safe_edit(query, "No tienes cuentas registradas.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
     text = "🏅 **Tu ranking**\n\n"
     for i, acc in enumerate(all_accounts, 1):
@@ -673,7 +803,8 @@ async def callback_my_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE
     text += "\n🔝 Top 5:\n"
     for i, acc in enumerate(all_accounts[:5], 1):
         text += f"{i}. {acc['username']} - ⚔️ {acc['attack']:,}\n"
-    await safe_edit(query, text, parse_mode="Markdown")
+    keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
+    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 # send_id_request: callback para usuarios no autorizados que envía la solicitud al admin
 @restricted_callback
@@ -831,39 +962,45 @@ async def callback_cancel_delete_account(update: Update, context: ContextTypes.D
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
-        await update.message.reply_text("Acceso denegado.")
+        if update.message:
+            await update.message.reply_text("Acceso denegado.")
+        elif update.callback_query:
+            await update.callback_query.answer("Acceso denegado", show_alert=True)
         return
+
     data = load_data()
-    users = list(data.items())
-    if not users:
-        await update.message.reply_text("No hay usuarios registrados.")
+    if not data:
+        if update.callback_query:
+            await safe_edit(update.callback_query, "No hay usuarios registrados.")
+        else:
+            await update.message.reply_text("No hay usuarios registrados.")
         return
-    page = int(context.user_data.get("admin_users_page", 1))
-    per_page = 8
-    total_pages = max(1, ceil(len(users) / per_page))
-    page = max(1, min(page, total_pages))
-    context.user_data["admin_users_page"] = page
-    start = (page - 1) * per_page
-    end = start + per_page
-    slice_users = users[start:end]
-    keyboard = []
-    keyboard.append([InlineKeyboardButton("📣 Enviar mensaje global", callback_data="admin_broadcast")])
-    for user_id_str, user_data in slice_users:
+
+    # Construir texto agrupado por usuario
+    text = "🧾 **Cuentas por usuario**\n\n"
+    for user_id_str, user_data in data.items():
         display = user_data.get("telegram_name", f"User {user_id_str}")
-        keyboard.append([InlineKeyboardButton(f"🧑 {display}", callback_data=f"admin_user:{user_id_str}")])
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data="admin_users_prev"))
-    if page < total_pages:
-        nav.append(InlineKeyboardButton("Siguiente ➡️", callback_data="admin_users_next"))
-    if nav:
-        keyboard.append(nav)
+        accounts = user_data.get("accounts", [])
+        text += f"👤 **{display}** (ID: `{user_id_str}`)\n"
+        if accounts:
+            for acc in sorted(accounts, key=lambda x: x.get("attack", 0), reverse=True):
+                text += f"  • {acc['username']}: ⚔️ {acc['attack']:,}  🛡️ {acc['defense']:,}\n"
+        else:
+            text += "  • _Sin cuentas_\n"
+        text += "\n"
+
+    # Teclado: botones rápidos por usuario (ver detalles / eliminar) + volver
+    keyboard = []
+    for user_id_str, user_data in data.items():
+        display = user_data.get("telegram_name", f"User {user_id_str}")
+        keyboard.append([InlineKeyboardButton(f"Ver {display}", callback_data=f"admin_user:{user_id_str}")])
     keyboard.append([InlineKeyboardButton("↩️ Volver", callback_data="menu_back")])
+
+    reply = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text("Menú administrador:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit(update.callback_query, text, reply_markup=reply, parse_mode="Markdown")
     else:
-        await update.message.reply_text("Menú administrador:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(text, reply_markup=reply, parse_mode="Markdown")
 
 @restricted_callback
 async def callback_admin_users_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1205,6 +1342,10 @@ async def callback_accounts_pagination(update: Update, context: ContextTypes.DEF
     elif data == "accounts_prev":
         context.user_data["accounts_page"] = max(1, page - 1)
     await send_accounts_list_for_edit(update, context)
+    
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+   
 # --- FIN BLOQUE ---
 def main():
     application = Application.builder().token(TOKEN).build()
