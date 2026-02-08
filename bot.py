@@ -511,502 +511,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /deleteuserdata <id> - Borrar datos de un usuario (admin)
 /broadcast <mensaje> - Enviar mensaje a todos los usuarios (admin)
 """
-    await update.message.reply_text(help_tex
-
-import os
-import json
-import logging
-import asyncio
-import base64
-import time
-from datetime import datetime
-from typing import Optional, List
-
-import requests
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-    BotCommandScopeDefault,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-from telegram.error import BadRequest, RetryAfter, Unauthorized, TelegramError
-
-# ================= CONFIGURACIÓN (desde env) =================
-TOKEN = os.environ.get("TOKEN")
-if not TOKEN:
-    raise RuntimeError("La variable de entorno TOKEN no está definida.")
-
-ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")  # opcional
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Ej: https://mi-servicio.onrender.com/<token>
-PORT = int(os.environ.get("PORT", "8443"))
-
-# GitHub storage config
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_OWNER = os.environ.get("GITHUB_OWNER")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")
-GITHUB_DATA_PATH = os.environ.get("GITHUB_DATA_PATH", "data/clan_data.json")
-GITHUB_AUTH_PATH = os.environ.get("GITHUB_AUTH_PATH", "data/authorized_users.json")
-GITHUB_API = "https://api.github.com"
-
-# Configurar logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ================= UTILIDADES GITHUB =================
-HEADERS = {"Accept": "application/vnd.github.v3+json"}
-if GITHUB_TOKEN:
-    HEADERS["Authorization"] = f"token {GITHUB_TOKEN}"
-
-REQUEST_TIMEOUT = 10  # segundos
-
-def _get_file_from_github(path: str):
-    """Devuelve (content:str, sha:str) o (None, None) si no existe."""
-    if not (GITHUB_OWNER and GITHUB_REPO):
-        raise RuntimeError("GITHUB_OWNER y GITHUB_REPO deben estar configurados.")
-    url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            j = r.json()
-            content = base64.b64decode(j["content"]).decode("utf-8")
-            sha = j["sha"]
-            return content, sha
-        if r.status_code == 404:
-            return None, None
-        # Log para depuración
-        logger.error("GitHub GET %s responded %s: %s", url, r.status_code, r.text)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        logger.exception("Error de red al obtener archivo de GitHub: %s", e)
-        raise
-
-def _put_file_to_github(path: str, content_str: str, sha: Optional[str] = None, message: Optional[str] = None):
-    """Crea o actualiza archivo. content_str es texto (JSON)."""
-    if not (GITHUB_OWNER and GITHUB_REPO):
-        raise RuntimeError("GITHUB_OWNER y GITHUB_REPO deben estar configurados.")
-    url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
-    b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
-    payload = {
-        "message": message or f"Update {path} by bot {int(time.time())}",
-        "content": b64,
-    }
-    if sha:
-        payload["sha"] = sha
-    try:
-        r = requests.put(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
-        if r.status_code in (200, 201):
-            return r.json()
-        logger.error("GitHub PUT %s responded %s: %s", url, r.status_code, r.text)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        logger.exception("Error de red al guardar archivo en GitHub: %s", e)
-        raise
-
-# ================= FUNCIONES DE DATOS (GITHUB) =================
-def load_data():
-    """Carga clan_data.json desde GitHub; devuelve dict vacío si no existe o error."""
-    try:
-        content, sha = _get_file_from_github(GITHUB_DATA_PATH)
-        if content is None:
-            return {}
-        return json.loads(content)
-    except Exception as e:
-        logger.error("Error cargando datos desde GitHub: %s", e)
-        return {}
-
-def save_data(data: dict):
-    """Guarda el dict 'data' en GitHub en GITHUB_DATA_PATH. Retorna True/False."""
-    try:
-        content, sha = _get_file_from_github(GITHUB_DATA_PATH)
-        new_content = json.dumps(data, ensure_ascii=False, indent=2)
-        _put_file_to_github(GITHUB_DATA_PATH, new_content, sha=sha, message="Save clan data")
-        return True
-    except Exception as e:
-        logger.exception("Error guardando datos en GitHub: %s", e)
-        return False
-
-def load_authorized_users() -> List[int]:
-    """Carga authorized_users.json desde GitHub; si no existe devuelve [ADMIN_USER_ID]."""
-    try:
-        content, sha = _get_file_from_github(GITHUB_AUTH_PATH)
-        if content is None:
-            return [ADMIN_USER_ID] if ADMIN_USER_ID else []
-        data = json.loads(content)
-        ids = data.get("authorized_ids", [ADMIN_USER_ID] if ADMIN_USER_ID else [])
-        # Normalizar a enteros
-        normalized = []
-        for x in ids:
-            try:
-                normalized.append(int(x))
-            except Exception:
-                logger.warning("ID autorizado no convertible a int: %s", x)
-        return normalized
-    except Exception as e:
-        logger.exception("Error cargando usuarios autorizados desde GitHub: %s", e)
-        return [ADMIN_USER_ID] if ADMIN_USER_ID else []
-
-def save_authorized_users(user_ids: List[int]):
-    """Guarda la lista de user_ids en GitHub. Retorna True/False."""
-    try:
-        content, sha = _get_file_from_github(GITHUB_AUTH_PATH)
-        new_content = json.dumps({"authorized_ids": user_ids}, ensure_ascii=False, indent=2)
-        _put_file_to_github(GITHUB_AUTH_PATH, new_content, sha=sha, message="Save authorized users")
-        return True
-    except Exception as e:
-        logger.exception("Error guardando usuarios autorizados en GitHub: %s", e)
-        return False
-
-def save_data_with_retry(data: dict, retries: int = 3, delay: float = 0.5):
-    """Helper con reintentos para reducir conflictos simples."""
-    for attempt in range(retries):
-        try:
-            ok = save_data(data)
-            if ok:
-                return True
-            # si save_data devolvió False, esperar y reintentar
-            time.sleep(delay * (attempt + 1))
-        except Exception as e:
-            logger.exception("Error guardando datos en GitHub (intento %s): %s", attempt + 1, e)
-            time.sleep(delay * (attempt + 1))
-    logger.error("No se pudo guardar datos en GitHub tras %s intentos", retries)
-    return False
-
-# ================= FUNCIONES DE NEGOCIO =================
-def get_user_accounts(user_id: int):
-    """Obtener cuentas de un usuario desde GitHub-backed JSON."""
-    data = load_data()
-    return data.get(str(user_id), {}).get("accounts", [])
-
-def add_user_account(user_id: int, account_data: dict):
-    """Añadir o actualizar cuenta de usuario en el JSON almacenado en GitHub."""
-    data = load_data()
-    user_id_str = str(user_id)
-    if user_id_str not in data:
-        data[user_id_str] = {
-            "telegram_name": account_data.get("telegram_name", ""),
-            "accounts": []
-        }
-    accounts = data[user_id_str].get("accounts", [])
-    for i, account in enumerate(accounts):
-        if account["username"].lower() == account_data["username"].lower():
-            accounts[i] = account_data
-            data[user_id_str]["accounts"] = accounts
-            save_data_with_retry(data)
-            return "updated"
-    accounts.append(account_data)
-    data[user_id_str]["accounts"] = accounts
-    save_data_with_retry(data)
-    return "added"
-
-def delete_user_account(user_id: int, username: str):
-    """Eliminar cuenta de usuario y persistir en GitHub."""
-    data = load_data()
-    user_id_str = str(user_id)
-    if user_id_str in data:
-        accounts = data[user_id_str].get("accounts", [])
-        new_accounts = [acc for acc in accounts if acc["username"].lower() != username.lower()]
-        if len(new_accounts) < len(accounts):
-            data[user_id_str]["accounts"] = new_accounts
-            save_data_with_retry(data)
-            return True
-    return False
-
-def admin_delete_user_data(user_id: int) -> bool:
-    """Eliminar por completo los datos de un usuario (solo admin)."""
-    data = load_data()
-    user_key = str(user_id)
-    if user_key in data:
-        del data[user_key]
-        ok = save_data_with_retry(data)
-        if ok:
-            logger.info("Admin borró datos del usuario %s", user_id)
-        else:
-            logger.error("Fallo al persistir borrado de usuario %s", user_id)
-        return ok
-    logger.warning("Intento de borrar datos de usuario no existente: %s", user_id)
-    return False
-
-async def broadcast_message_to_all(app: Application, text: str) -> dict:
-    """
-    Enviar un mensaje a todos los usuarios que tengan datos en el JSON.
-    Retorna un dict con estadísticas: {sent: n, failed: n, errors: [...]}
-    """
-    data = load_data()
-    user_ids = [int(k) for k in data.keys() if k.isdigit()]
-    sent = 0
-    failed = 0
-    errors = []
-    for uid in user_ids:
-        try:
-            await app.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown")
-            sent += 1
-            # evitar rate limits agresivos
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            failed += 1
-            errors.append({"user_id": uid, "error": str(e)})
-            logger.warning("No se pudo enviar broadcast a %s: %s", uid, e)
-            # si RetryAfter, podríamos esperar; aquí lo registramos y seguimos
-    return {"sent": sent, "failed": failed, "errors": errors}
-
-# ================= FUNCIONES DE INFORME =================
-def generate_public_report():
-    """Generar informe público (sin dueños visibles)"""
-    data = load_data()
-    if not data:
-        return "📭 **No hay datos registrados aún.**"
-    all_accounts = []
-    for user_data in data.values():
-        accounts = user_data.get("accounts", [])
-        all_accounts.extend([{
-            "username": acc["username"],
-            "attack": acc["attack"],
-            "defense": acc["defense"]
-        } for acc in accounts])
-    if not all_accounts:
-        return "📭 **No hay cuentas registradas en el clan.**"
-    all_accounts.sort(key=lambda x: x["attack"], reverse=True)
-    display_limit = min(30, len(all_accounts))
-    accounts_to_show = all_accounts[:display_limit]
-    total_attack = sum(acc["attack"] for acc in all_accounts)
-    total_defense = sum(acc["defense"] for acc in all_accounts)
-    report = "🏆 **INFORME DEL CLAN** 🏆\n\n"
-    report += f"📊 **Cuentas registradas:** {len(all_accounts)}\n"
-    report += f"⚔️ **Ataque total:** {total_attack:,}\n"
-    report += f"🛡️ **Defensa total:** {total_defense:,}\n"
-    report += "────────────────────────\n\n"
-    medals = ["🥇", "🥈", "🥉", "4.", "5.", "6.", "7.", "8.", "9.", "10."]
-    for i, account in enumerate(accounts_to_show[:10], 1):
-        medal = medals[i - 1] if i <= 10 else f"{i}."
-        report += f"{medal} **{account['username']}**\n"
-        report += f"   ⚔️ {account['attack']:,}  🛡️ {account['defense']:,}\n"
-        if i < 10 and i < len(accounts_to_show):
-            report += "   ─────────────────────\n"
-    if len(all_accounts) > display_limit:
-        report += f"\n📌 ... y {len(all_accounts) - display_limit} cuenta(s) más\n"
-    return report
-
-def generate_admin_report():
-    """Generar informe para administrador"""
-    data = load_data()
-    if not data:
-        return "📭 **No hay datos registrados aún.**"
-    report = "🔒 **INFORME ADMINISTRADOR** 🔒\n\n"
-    total_members = 0
-    total_accounts = 0
-    total_attack = 0
-    total_defense = 0
-    for user_id_str, user_data in data.items():
-        accounts = user_data.get("accounts", [])
-        if accounts:
-            total_members += 1
-            total_accounts += len(accounts)
-            user_attack = sum(acc["attack"] for acc in accounts)
-            user_defense = sum(acc["defense"] for acc in accounts)
-            total_attack += user_attack
-            total_defense += user_defense
-            report += f"👤 **{user_data.get('telegram_name', 'Usuario')}** (ID: {user_id_str})\n"
-            report += f"   📊 Cuentas: {len(accounts)}\n"
-            report += f"   ⚔️ Ataque: {user_attack:,}\n"
-            report += f"   🛡️ Defensa: {user_defense:,}\n"
-            for acc in sorted(accounts, key=lambda x: x["attack"], reverse=True):
-                report += f"     • {acc['username']}: ⚔️{acc['attack']:,} 🛡️{acc['defense']:,}\n"
-            report += "   ─────────────────────\n"
-    report += f"\n📈 **ESTADÍSTICAS:**\n"
-    report += f"👥 Miembros activos: {total_members}\n"
-    report += f"📂 Total cuentas: {total_accounts}\n"
-    report += f"⚔️ Ataque total: {total_attack:,}\n"
-    report += f"🛡️ Defensa total: {total_defense:,}\n"
-    return report
-
-# ================= UTILIDADES DE TELEGRAM (seguras) =================
-async def safe_answer_callback(query, text: Optional[str] = None, show_alert: bool = False):
-    """Responder callback query de forma segura (captura excepciones comunes)."""
-    if not query:
-        return
-    try:
-        if text:
-            await query.answer(text=text, show_alert=show_alert)
-        else:
-            await query.answer()
-    except RetryAfter as e:
-        logger.warning("RetryAfter al responder callback: %s", e)
-        # Podríamos esperar e intentar de nuevo si se desea
-    except BadRequest as e:
-        # Errores típicos: "Query is too old", "Message to edit not found", etc.
-        logger.warning("BadRequest al responder callback: %s", e)
-    except Unauthorized as e:
-        logger.error("Unauthorized al responder callback: %s", e)
-    except TelegramError as e:
-        logger.exception("Error de Telegram al responder callback: %s", e)
-    except Exception as e:
-        logger.exception("Error inesperado al responder callback: %s", e)
-
-async def safe_edit_message(query, text: str, reply_markup=None, parse_mode=None):
-    """Editar mensaje de callback de forma segura."""
-    if not query:
-        return
-    try:
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except BadRequest as e:
-        logger.warning("No se pudo editar mensaje (BadRequest): %s", e)
-    except Exception as e:
-        logger.exception("Error editando mensaje: %s", e)
-
-# ================= DECORADORES =================
-def restricted(func):
-    """Decorador para restringir comandos"""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not is_user_authorized(user_id):
-            if update.message:
-                await update.message.reply_text(
-                    "❌ **Acceso denegado**\n\n"
-                    "No estás autorizado para usar este bot.\n"
-                    "Contacta al administrador y envía tu ID:\n"
-                    "`/getid`",
-                    parse_mode="Markdown"
-                )
-            elif update.callback_query:
-                await safe_answer_callback(update.callback_query, text="❌ No autorizado", show_alert=True)
-            return
-        return await func(update, context)
-    return wrapper
-
-def restricted_callback(func):
-    """Decorador para restringir callbacks"""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        user_id = query.from_user.id
-        if not is_user_authorized(user_id):
-            await safe_answer_callback(query, text="❌ No estás autorizado para usar este bot", show_alert=True)
-            return
-        return await func(update, context)
-    return wrapper
-
-# ================= UTILIDADES DE AUTORIZACIÓN =================
-def is_user_authorized(user_id: int) -> bool:
-    """Verificar si usuario está autorizado"""
-    authorized_ids = load_authorized_users()
-    return user_id in authorized_ids
-
-def is_admin(user_id: int) -> bool:
-    """Verificar si es administrador"""
-    return user_id == ADMIN_USER_ID
-
-# ================= COMANDOS PÚBLICOS =================
-async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Obtener ID de usuario, enviar automáticamente al admin y mostrar botón de contacto."""
-    user = update.effective_user
-
-    admin_username = ADMIN_USERNAME
-    admin_id = ADMIN_USER_ID if ADMIN_USER_ID != 0 else None
-
-    user_text = (
-        f"👤 **Tu ID de Telegram:**\n"
-        f"`{user.id}`\n\n"
-        f"📛 **Nombre:** {user.first_name}\n"
-        f"🔗 **Username:** @{user.username if user.username else 'No tiene'}\n\n"
-        "He enviado tu ID al administrador para que te autorice. "
-        "Por favor, espera la confirmación."
-    )
-
-    sent_to_admin = False
-    admin_contact_url = None
-
-    if admin_username:
-        admin_username = admin_username.lstrip("@")
-        admin_contact_url = f"https://t.me/{admin_username}"
-    elif admin_id:
-        admin_contact_url = f"tg://user?id={admin_id}"
-
-    if admin_id:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
-                    f"👤 Usuario: {user.first_name}\n"
-                    f"🆔 ID: `{user.id}`\n"
-                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
-                    f"Para autorizar usa: `/adduser {user.id}`"
-                ),
-                parse_mode="Markdown"
-            )
-            sent_to_admin = True
-        except Exception as e:
-            logger.warning("No se pudo enviar la solicitud al admin por ID: %s", e)
-
-    if not sent_to_admin and admin_username:
-        try:
-            await context.bot.send_message(
-                chat_id=f"@{admin_username}",
-                text=(
-                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
-                    f"👤 Usuario: {user.first_name}\n"
-                    f"🆔 ID: `{user.id}`\n"
-                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
-                    f"Para autorizar usa: `/adduser {user.id}`"
-                ),
-                parse_mode="Markdown"
-            )
-            sent_to_admin = True
-        except Exception as e:
-            logger.warning("No se pudo enviar la solicitud al admin por username: %s", e)
-
-    if admin_contact_url:
-        keyboard = [[InlineKeyboardButton("✉️ Contactar al admin", url=admin_contact_url)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(user_text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        admin_display = str(ADMIN_USER_ID) if ADMIN_USER_ID else "No configurado"
-        extra = f"\n\nID del admin: `{admin_display}`"
-        await update.message.reply_text(user_text + extra, parse_mode="Markdown")
-
-    if not sent_to_admin:
-        try:
-            await update.message.reply_text(
-                "⚠️ No pude notificar automáticamente al administrador. "
-                "Por favor, envía tu ID manualmente o contacta al admin.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando de ayuda"""
-    help_text = """
-🧭 **BOT DEL CLAN - AYUDA**
-
-**Comandos:**
-/start - Iniciar el bot
-/getid - Obtener tu ID de Telegram
-/help - Mostrar esta ayuda
-
-**Miembros autorizados:**
-/register - Registrar tus cuentas (en privado)
-/report - Ver informe del clan
-
-**Administrador:**
-/admin - Vista de administrador
-/adduser <id> - Añadir usuario autorizado
-/deleteuserdata <id> - Borrar datos de un usuario (admin)
-/broadcast <mensaje> - Enviar mensaje a todos los usuarios (admin)
-"""
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 # ================= MANEJO DE START =================
@@ -1148,7 +652,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await safe_edit_message(query, "Opción no reconocida.")
     except Exception as e:
         logger.exception("Error manejando callback '%s': %s", data, e)
-        # Intentar informar al usuario sin romper el flujo
         try:
             await safe_edit_message(query, "Ocurrió un error procesando la acción.")
         except Exception:
@@ -1243,35 +746,39 @@ async def start_edit_account_flow(update: Update, context: ContextTypes.DEFAULT_
 async def handle_edit_account_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manejar mensajes durante el flujo de edición (ataque/defensa)"""
     state = context.user_data.get("state")
-    user_id = update.effective_user.id
+    if not state:
+        return False
 
+    # We expect messages for edit flow to come as text messages (private chat)
     if state == "awaiting_edit_attack":
+        text = update.message.text.strip() if update.message and update.message.text else ""
         try:
-            attack = int(update.message.text.replace(".", "").replace(",", "").strip())
+            attack = int(text.replace(".", "").replace(",", "").strip())
             if attack <= 0:
                 await update.message.reply_text("❌ El ataque debe ser mayor a 0. Intenta de nuevo:")
                 return True
             context.user_data["edit_attack"] = attack
             context.user_data["state"] = "awaiting_edit_defense"
             await update.message.reply_text(
-                f"⚔️ Nuevo ataque: {attack:,}\n\nAhora envía el nuevo **poder de defensa** (solo números):",
+                f"⚔️ Nuevo ataque: {attack:,}\n\n"
+                "Ahora envía el nuevo **poder de defensa** (solo números):",
                 parse_mode="Markdown"
             )
-        except ValueError:
+        except Exception:
             await update.message.reply_text("❌ Por favor, envía solo números. Intenta de nuevo:")
         return True
 
     if state == "awaiting_edit_defense":
+        text = update.message.text.strip() if update.message and update.message.text else ""
         try:
-            defense = int(update.message.text.replace(".", "").replace(",", "").strip())
+            defense = int(text.replace(".", "").replace(",", "").strip())
             if defense <= 0:
                 await update.message.reply_text("❌ La defensa debe ser mayor a 0. Intenta de nuevo:")
                 return True
             username = context.user_data.get("edit_username")
             attack = context.user_data.get("edit_attack")
-            # Cargar cuentas y actualizar la correspondiente
             data = load_data()
-            user_key = str(user_id)
+            user_key = str(update.effective_user.id)
             updated = False
             if user_key in data:
                 accounts = data[user_key].get("accounts", [])
@@ -1285,7 +792,6 @@ async def handle_edit_account_message(update: Update, context: ContextTypes.DEFA
                 if updated:
                     data[user_key]["accounts"] = accounts
                     save_data_with_retry(data)
-            # Limpiar estado
             context.user_data.clear()
             if updated:
                 await update.message.reply_text(
@@ -1299,28 +805,214 @@ async def handle_edit_account_message(update: Update, context: ContextTypes.DEFA
                     f"❌ No se encontró la cuenta *{username}* para actualizar.",
                     parse_mode="Markdown"
                 )
-        except ValueError:
+        except Exception:
             await update.message.reply_text("❌ Por favor, envía solo números. Intenta de nuevo:")
         return True
 
     return False
 
 # ================= MANEJO DE MENSAJES (registro y edición) =================
+
+# ----------------- Helpers de validación -----------------
+def _normalize_username(text: str) -> str:
+    """Normaliza y valida un username simple (sin espacios)."""
+    return text.strip()
+
+def _is_valid_username(text: str) -> bool:
+    u = _normalize_username(text)
+    if not u:
+        return False
+    if " " in u or len(u) > 32:
+        return False
+    return True
+
+# ----------------- Inicio del flujo: pedir username -----------------
+async def ask_account_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Inicia el flujo de registro pidiendo el nombre de usuario de la cuenta.
+    Se usa desde un callback (botón) o desde un comando en privado.
+    """
+    query = update.callback_query
+    prompt = (
+        "➕ **Registrar nueva cuenta**\n\n"
+        "Envía el **nombre de usuario** de la cuenta (sin @, sin espacios).\n\n"
+        "Puedes escribir `cancelar` para abortar."
+    )
+    if query:
+        await safe_answer_callback(query)
+        await safe_edit_message(query, prompt, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(prompt, parse_mode="Markdown")
+    context.user_data["state"] = "awaiting_username"
+
+# ----------------- Manejar mensajes durante el registro -----------------
+async def handle_registration_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Maneja los estados:
+      - awaiting_username
+      - awaiting_attack
+      - awaiting_defense
+
+    Devuelve True si el mensaje fue consumido por este flujo.
+    """
+    state = context.user_data.get("state")
+    if not state:
+        return False
+
+    text = ""
+    if update.message and update.message.text:
+        text = update.message.text.strip()
+    elif update.callback_query and update.callback_query.data:
+        text = update.callback_query.data.strip()
+    else:
+        return False
+
+    # Permitir cancelar en cualquier paso
+    if text.lower() in ("cancel", "cancelar", "/cancel"):
+        context.user_data.clear()
+        if update.message:
+            await update.message.reply_text("❌ Registro cancelado.")
+        elif update.callback_query:
+            await safe_edit_message(update.callback_query, "❌ Registro cancelado.")
+        return True
+
+    # ---------- awaiting_username ----------
+    if state == "awaiting_username":
+        if not _is_valid_username(text):
+            msg = "❌ Username inválido. Debe ser sin espacios y hasta 32 caracteres. Intenta de nuevo:"
+            if update.message:
+                await update.message.reply_text(msg)
+            else:
+                await safe_edit_message(update.callback_query, msg)
+            return True
+
+        username = _normalize_username(text).lstrip("@")
+        context.user_data["new_username"] = username
+        context.user_data["state"] = "awaiting_attack"
+
+        prompt = (
+            f"✏️ **Cuenta:** {username}\n\n"
+            "Envía el **poder de ataque** (solo números). Ejemplo: `125000`.\n\n"
+            "Escribe `cancelar` para abortar."
+        )
+        if update.message:
+            await update.message.reply_text(prompt, parse_mode="Markdown")
+        else:
+            await safe_edit_message(update.callback_query, prompt, parse_mode="Markdown")
+        return True
+
+    # ---------- awaiting_attack ----------
+    if state == "awaiting_attack":
+        try:
+            attack = int(text.replace(".", "").replace(",", ""))
+            if attack <= 0:
+                raise ValueError()
+        except Exception:
+            msg = "❌ Valor de ataque inválido. Envía solo números mayores a 0. Intenta de nuevo:"
+            if update.message:
+                await update.message.reply_text(msg)
+            else:
+                await safe_edit_message(update.callback_query, msg)
+            return True
+
+        context.user_data["new_attack"] = attack
+        context.user_data["state"] = "awaiting_defense"
+
+        prompt = (
+            f"⚔️ Ataque registrado: {attack:,}\n\n"
+            "Ahora envía el **poder de defensa** (solo números). Ejemplo: `90000`.\n\n"
+            "Escribe `cancelar` para abortar."
+        )
+        if update.message:
+            await update.message.reply_text(prompt, parse_mode="Markdown")
+        else:
+            await safe_edit_message(update.callback_query, prompt, parse_mode="Markdown")
+        return True
+
+    # ---------- awaiting_defense ----------
+    if state == "awaiting_defense":
+        try:
+            defense = int(text.replace(".", "").replace(",", ""))
+            if defense <= 0:
+                raise ValueError()
+        except Exception:
+            msg = "❌ Valor de defensa inválido. Envía solo números mayores a 0. Intenta de nuevo:"
+            if update.message:
+                await update.message.reply_text(msg)
+            else:
+                await safe_edit_message(update.callback_query, msg)
+            return True
+
+        # Recuperar datos temporales
+        username = context.user_data.get("new_username")
+        attack = context.user_data.get("new_attack")
+        user = update.effective_user
+        user_id = user.id
+
+        if not username or attack is None:
+            context.user_data.clear()
+            err = "❌ Error interno: faltan datos del registro. Por favor, inicia de nuevo."
+            if update.message:
+                await update.message.reply_text(err)
+            else:
+                await safe_edit_message(update.callback_query, err)
+            return True
+
+        # Construir estructura de cuenta
+        account_data = {
+            "username": username,
+            "attack": int(attack),
+            "defense": int(defense),
+            "telegram_name": f"{user.first_name} @{user.username}" if user.username else user.first_name,
+            "created_date": datetime.now().isoformat(),
+        }
+
+        # Guardar usando la función existente (add_user_account)
+        try:
+            result = add_user_account(user_id, account_data)  # "added" o "updated"
+            if update.message:
+                await update.message.reply_text(
+                    f"✅ Cuenta *{username}* { 'actualizada' if result=='updated' else 'registrada' }.\n"
+                    f"• ⚔️ Ataque: {attack:,}\n"
+                    f"• 🛡️ Defensa: {defense:,}",
+                    parse_mode="Markdown"
+                )
+            else:
+                await safe_edit_message(
+                    update.callback_query,
+                    f"✅ Cuenta *{username}* { 'actualizada' if result=='updated' else 'registrada' }.\n"
+                    f"• ⚔️ Ataque: {attack:,}\n"
+                    f"• 🛡️ Defensa: {defense:,}",
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.exception("Error guardando cuenta: %s", e)
+            if update.message:
+                await update.message.reply_text("❌ Ocurrió un error al guardar la cuenta. Intenta de nuevo más tarde.")
+            else:
+                await safe_edit_message(update.callback_query, "❌ Ocurrió un error al guardar la cuenta. Intenta de nuevo más tarde.")
+
+        # Limpiar estado
+        context.user_data.clear()
+        return True
+
+    return False
+
+# ----------------- Función principal de manejo de mensajes -----------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manejar mensajes de texto (flujo de registro y edición)"""
-    user_id = update.effective_user.id
-
-    # Priorizar flujo de edición si está activo
+    # 1) Priorizar flujo de edición si está activo
     handled = await handle_edit_account_message(update, context)
     if handled:
         return
 
-    state = context.user_data.get("state")
-    # Aquí iría el resto del flujo de registro (awaiting_username, awaiting_attack, etc.)
-    # Para mantener el ejemplo conciso, asumimos que el resto del flujo ya existe en tu bot original.
-    # Si necesitas que lo incluya completo, lo añado.
+    # 2) Priorizar flujo de registro si está activo
+    handled = await handle_registration_message(update, context)
+    if handled:
+        return
 
-    # Ejemplo: si no hay estado conocido, responder con ayuda
+    # 3) Comportamiento por defecto si no hay flujo activo
+    state = context.user_data.get("state")
     if not state:
         await update.message.reply_text("Usa /help para ver los comandos disponibles.")
 
@@ -1363,7 +1055,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await broadcast_message_to_all(context.application, text)
     await update.message.reply_text(f"✅ Envío finalizado. Enviados: {result['sent']}. Fallidos: {result['failed']}.")
 
-# ================= ADMIN: añadir usuario autorizado (ejemplo) =================
+# ================= ADMIN: añadir usuario autorizado =================
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando admin para añadir usuario autorizado: /adduser <id>"""
     user = update.effective_user
@@ -1403,6 +1095,58 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = generate_admin_report()
     await update.message.reply_text(text, parse_mode="Markdown")
 
+# ================= FUNCIONES AUXILIARES (placeholders que puedes ampliar) =================
+async def show_clan_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostrar informe público (callback)"""
+    query = update.callback_query
+    text = generate_public_report()
+    await safe_edit_message(query, text, parse_mode="Markdown")
+
+async def show_my_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostrar ranking personal (callback)"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    accounts = get_user_accounts(user_id)
+    if not accounts:
+        await safe_edit_message(query, "📭 No tienes cuentas registradas.", parse_mode="Markdown")
+        return
+    accounts_sorted = sorted(accounts, key=lambda x: x["attack"], reverse=True)
+    text = "📈 **Tu ranking:**\n\n"
+    for i, acc in enumerate(accounts_sorted, 1):
+        text += f"{i}. {acc['username']}: ⚔️{acc['attack']:,} 🛡️{acc['defense']:,}\n"
+    await safe_edit_message(query, text, parse_mode="Markdown")
+
+async def show_admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostrar informe admin (callback)"""
+    query = update.callback_query
+    text = generate_admin_report()
+    await safe_edit_message(query, text, parse_mode="Markdown")
+
+async def show_group_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostrar informe en grupo (callback)"""
+    query = update.callback_query
+    text = generate_public_report()
+    await safe_edit_message(query, text, parse_mode="Markdown")
+
+async def send_id_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enviar solicitud de ID al admin (callback)"""
+    query = update.callback_query
+    user = query.from_user
+    admin_id = ADMIN_USER_ID if ADMIN_USER_ID else None
+    if admin_id:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"➡️ Solicitud de acceso de {user.first_name} (ID: `{user.id}`)",
+                parse_mode="Markdown"
+            )
+            await safe_edit_message(query, "✅ He enviado tu solicitud al administrador.")
+        except Exception as e:
+            logger.warning("No se pudo notificar al admin: %s", e)
+            await safe_edit_message(query, "⚠️ No pude notificar al administrador.")
+    else:
+        await safe_edit_message(query, "⚠️ No hay administrador configurado.")
+
 # ================= REGISTRO DE HANDLERS Y ARRANQUE =================
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -1416,6 +1160,7 @@ def main():
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("deleteuserdata", cmd_deleteuserdata))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("register", ask_account_username))
 
     # Callbacks y mensajes
     app.add_handler(CallbackQueryHandler(handle_callback_query))
@@ -1429,13 +1174,13 @@ def main():
             BotCommand("getid", "Obtener tu ID"),
             BotCommand("report", "Ver informe del clan"),
             BotCommand("admin", "Vista admin (si eres admin)"),
+            BotCommand("register", "Registrar una cuenta")
         ], scope=BotCommandScopeDefault())
     except Exception as e:
         logger.warning("No se pudieron registrar comandos: %s", e)
 
     # Arranque: si WEBHOOK_URL está configurado, usar webhook; si no, polling (útil en local)
     if WEBHOOK_URL:
-        # Configurar webhook (Render u otros)
         logger.info("Iniciando en modo webhook en %s (puerto %s)", WEBHOOK_URL, PORT)
         app.run_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN, webhook_url=WEBHOOK_URL)
     else:
