@@ -702,6 +702,38 @@ def main():
     # Ejecutar polling (o webhook si prefieres)
     logger.info("Arrancando bot...")
     app.run_polling()
+# ================= MAIN / WEBHOOK =================
+def main():
+    if not WEBHOOK_URL:
+        raise RuntimeError(
+            "WEBHOOK_URL no estÃ¡ definida. En Render configura WEBHOOK_URL a la URL pÃºblica de tu servicio "
+            "(ej: https://mi-app.onrender.com/<TOKEN>)."
+        )
+
+    application = build_application()
+    loop = asyncio.get_event_loop()
+
+    # Registrar comandos en Telegram
+    try:
+        loop.run_until_complete(register_bot_commands(application))
+    except Exception as e:
+        logger.warning("No se pudieron registrar comandos automÃ¡ticamente: %s", e)
+
+    # Registrar webhook y arrancar servidor integrado (si PTB fue instalado con extras webhooks)
+    listen_addr = "0.0.0.0"
+    port = int(os.environ.get("PORT", PORT))
+    url_path = f"/{TOKEN}"
+
+    logger.info("Estableciendo webhook en %s (url_path %s) en el puerto %s", WEBHOOK_URL, url_path, port)
+
+    application.run_webhook(
+        listen=listen_addr,
+        port=port,
+        url_path=url_path,
+        webhook_url=WEBHOOK_URL,
+        max_connections=1,
+    )
+
 
 if __name__ == "__main__":
     main()
