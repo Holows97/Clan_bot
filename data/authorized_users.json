@@ -2,5 +2,15 @@
   "authorized_ids": [
     1196575284,
     7470037078
+  ],
+  "user_info": {
+    "1196575284": {
+      "username": "Holows",
+      "first_name": "GıιɖąɾԵʂ༒",
+      "last_interaction": 1770669391
+    }
+  },
+  "admin_ids": [
+    1196575284
   ]
 }
