@@ -380,7 +380,44 @@ async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📬 He enviado tu ID al administrador para que te autorice. "
         "Por favor, espera la confirmación."
     )
+#======Notificación al Admin
+async def notify_admin_request(app_bot, user):
+    """
+    Envía al admin una notificación con botones para aceptar/denegar.
+    No guarda solicitudes en disco; el admin actúa directamente desde el mensaje.
+    """
+    text = (
+        f"➡️ **SOLICITUD DE ACCESO**\n\n"
+        f"👤 Usuario: {user.first_name}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
+        f"Acciones:"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Aceptar", callback_data=f"admin_request:accept:{user.id}"),
+            InlineKeyboardButton("❌ Denegar", callback_data=f"admin_request:deny:{user.id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
+    sent = False
+    # Intentar enviar por ID primero
+    if ADMIN_USER_ID:
+        try:
+            await app_bot.send_message(chat_id=ADMIN_USER_ID, text=text, parse_mode="Markdown", reply_markup=reply_markup)
+            sent = True
+        except Exception as e:
+            logger.warning("No se pudo notificar al admin por ID: %s", e)
+    # Si no se envió y hay username, intentar por username
+    if not sent and ADMIN_USERNAME:
+        try:
+            await app_bot.send_message(chat_id=f"@{ADMIN_USERNAME.lstrip('@')}", text=text, parse_mode="Markdown", reply_markup=reply_markup)
+            sent = True
+        except Exception as e:
+            logger.warning("No se pudo notificar al admin por username: %s", e)
+    return sent
+#======Notificar Al Usuario Aceptado/Denegado====
 @restricted_callback
 async def callback_admin_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -484,45 +521,52 @@ async def callback_admin_request(update: Update, context: ContextTypes.DEFAULT_T
             )
         except Exception:
             pass
-#======Notificación al Admin
-async def notify_admin_request(app_bot, user):
-    """
-    Envía al admin una notificación con botones para aceptar/denegar.
-    No guarda solicitudes en disco; el admin actúa directamente desde el mensaje.
-    """
-    text = (
-        f"➡️ **SOLICITUD DE ACCESO**\n\n"
-        f"👤 Usuario: {user.first_name}\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
-        f"Acciones:"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Aceptar", callback_data=f"admin_request:accept:{user.id}"),
-            InlineKeyboardButton("❌ Denegar", callback_data=f"admin_request:deny:{user.id}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    sent = False
-    # Intentar enviar por ID primero
-    if ADMIN_USER_ID:
+#======send_id_request: callback para usuarios no autorizados que envía la solicitud al admin
+@restricted_callback
+async def callback_send_id_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    admin_username = ADMIN_USERNAME
+    admin_id = ADMIN_USER_ID if ADMIN_USER_ID != 0 else None
+    sent_to_admin = False
+    if admin_id:
         try:
-            await app_bot.send_message(chat_id=ADMIN_USER_ID, text=text, parse_mode="Markdown", reply_markup=reply_markup)
-            sent = True
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
+                    f"👤 Usuario: {user.first_name}\n"
+                    f"🆔 ID: `{user.id}`\n"
+                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
+                    f"Para autorizar usa: `/adduser {user.id}`"
+                ),
+                parse_mode="Markdown"
+            )
+            sent_to_admin = True
         except Exception as e:
-            logger.warning("No se pudo notificar al admin por ID: %s", e)
-    # Si no se envió y hay username, intentar por username
-    if not sent and ADMIN_USERNAME:
+            logger.warning("No se pudo enviar la solicitud al admin por ID: %s", e)
+    if not sent_to_admin and admin_username:
         try:
-            await app_bot.send_message(chat_id=f"@{ADMIN_USERNAME.lstrip('@')}", text=text, parse_mode="Markdown", reply_markup=reply_markup)
-            sent = True
+            await context.bot.send_message(
+                chat_id=f"@{admin_username}",
+                text=(
+                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
+                    f"👤 Usuario: {user.first_name}\n"
+                    f"🆔 ID: `{user.id}`\n"
+                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
+                    f"Para autorizar usa: `/adduser {user.id}`"
+                ),
+                parse_mode="Markdown"
+            )
+            sent_to_admin = True
         except Exception as e:
-            logger.warning("No se pudo notificar al admin por username: %s", e)
-    return sent
-
-
+            logger.warning("No se pudo enviar la solicitud al admin por username: %s", e)
+    if sent_to_admin:
+        await safe_edit(query, "Tu ID ha sido enviado al administrador. Espera la autorización.")
+    else:
+        await safe_edit(query, "No pude notificar al administrador automáticamente. Envía tu ID manualmente.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
@@ -799,58 +843,12 @@ async def callback_my_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = "🏅 **Tu ranking**\n\n"
     for i, acc in enumerate(all_accounts, 1):
         if acc["owner"] == str(user.id):
-            text += f"{i}. **{acc['username']}** - ⚔️ {acc['attack']:,}\n"
+            text += f"{i}. **{acc['username']}** - ⚔️ {acc['attack']:,}n"
     text += "\n🔝 Top 5:\n"
     for i, acc in enumerate(all_accounts[:5], 1):
         text += f"{i}. {acc['username']} - ⚔️ {acc['attack']:,}\n"
     keyboard = [[InlineKeyboardButton("↩️ Volver", callback_data="menu_back")]]
     await safe_edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-# send_id_request: callback para usuarios no autorizados que envía la solicitud al admin
-@restricted_callback
-async def callback_send_id_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    admin_username = ADMIN_USERNAME
-    admin_id = ADMIN_USER_ID if ADMIN_USER_ID != 0 else None
-    sent_to_admin = False
-    if admin_id:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
-                    f"👤 Usuario: {user.first_name}\n"
-                    f"🆔 ID: `{user.id}`\n"
-                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
-                    f"Para autorizar usa: `/adduser {user.id}`"
-                ),
-                parse_mode="Markdown"
-            )
-            sent_to_admin = True
-        except Exception as e:
-            logger.warning("No se pudo enviar la solicitud al admin por ID: %s", e)
-    if not sent_to_admin and admin_username:
-        try:
-            await context.bot.send_message(
-                chat_id=f"@{admin_username}",
-                text=(
-                    f"➡️ **SOLICITUD DE ACCESO**\n\n"
-                    f"👤 Usuario: {user.first_name}\n"
-                    f"🆔 ID: `{user.id}`\n"
-                    f"🔗 Username: @{user.username if user.username else 'No tiene'}\n\n"
-                    f"Para autorizar usa: `/adduser {user.id}`"
-                ),
-                parse_mode="Markdown"
-            )
-            sent_to_admin = True
-        except Exception as e:
-            logger.warning("No se pudo enviar la solicitud al admin por username: %s", e)
-    if sent_to_admin:
-        await safe_edit(query, "Tu ID ha sido enviado al administrador. Espera la autorización.")
-    else:
-        await safe_edit(query, "No pude notificar al administrador automáticamente. Envía tu ID manualmente.")
 
 # group_report: mostrar informe público en grupo (enviar nuevo mensaje)
 @restricted_callback
@@ -981,7 +979,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for user_id_str, user_data in data.items():
         display = user_data.get("telegram_name", f"User {user_id_str}")
         accounts = user_data.get("accounts", [])
-        text += f"👤 **{display}** (ID: `{user_id_str}`)\n"
+        text += f"👤*{display} | (🆔:{user_id_str} \n"
         if accounts:
             for acc in sorted(accounts, key=lambda x: x.get("attack", 0), reverse=True):
                 text += f"  • {acc['username']}: ⚔️ {acc['attack']:,}  🛡️ {acc['defense']:,}\n"
@@ -1370,6 +1368,7 @@ def main():
     application.add_handler(CallbackQueryHandler(callback_send_id_request, pattern=r"^send_id_request$"))
     application.add_handler(CallbackQueryHandler(callback_group_report, pattern=r"^group_report$"))
     application.add_handler(CallbackQueryHandler(callback_group_admin, pattern=r"^group_admin$"))
+    application.add_handler(CallbackQueryHandler(callback_admin_request, pattern=r"^admin_request:(accept|deny):\d+$"))
 
     # Callbacks: cuentas (paginación, editar, eliminar)
     application.add_handler(CallbackQueryHandler(callback_accounts_pagination, pattern=r"^accounts_(next|prev)$"))
